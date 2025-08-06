@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from datetime import datetime
 
 class TradeSignalBase(BaseModel):
@@ -36,9 +36,9 @@ class TradeRecordBase(BaseModel):
     exit_price: float
     volume: float
     pnl: float
-    duration: str
-    open_time: datetime
-    close_time: datetime
+    duration: Optional[Union[str, float, int]] = None
+    open_time: Optional[Union[datetime, float, int]] = None
+    close_time: Optional[Union[datetime, float, int]] = None
     details: Optional[Dict[str, Any]] = None
 
 class TradeRecordCreate(TradeRecordBase):

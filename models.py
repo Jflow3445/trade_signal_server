@@ -36,18 +36,17 @@ class LatestSignal(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
-# --- NEW: record of closed trades ---
 class TradeRecord(Base):
     __tablename__ = "trade_records"
     id = Column(Integer, primary_key=True, index=True)
     symbol = Column(String, index=True)
-    side = Column(String)        # buy/sell
+    side = Column(String)
     entry_price = Column(Float)
     exit_price = Column(Float)
     volume = Column(Float)
     pnl = Column(Float)
-    duration = Column(String)
-    open_time = Column(DateTime(timezone=True))
-    close_time = Column(DateTime(timezone=True))
+    duration = Column(String, nullable=True)
+    open_time = Column(DateTime(timezone=True), nullable=True)
+    close_time = Column(DateTime(timezone=True), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     details = Column(JSON, nullable=True)

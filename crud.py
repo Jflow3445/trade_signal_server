@@ -29,13 +29,35 @@ def get_latest_signal(db: Session, symbol: str):
 def get_user_by_api_key(db: Session, api_key: str):
     return db.query(User).filter(User.api_key == api_key).first()
 
-# --- Trade record CRUD ---
-def create_trade_record(db: Session, trade: TradeRecordCreate):
-    db_trade = TradeRecord(**trade.dict())
+def create_trade_record(db: Session, trade: TradeRecordCreate) -> TradeRecord:
+    # Convert open_time/close_time if float/int to datetime
+    def to_datetime(val):
+        if isinstance(val, (float, int)):
+            return datetime.utcfromtimestamp(val)
+        if isinstance(val, str):
+            try:
+                return datetime.fromisoformat(val)
+            except Exception:
+                return None
+        return val
+
+    db_trade = TradeRecord(
+        symbol=trade.symbol,
+        side=trade.side,
+        entry_price=trade.entry_price,
+        exit_price=trade.exit_price,
+        volume=trade.volume,
+        pnl=trade.pnl,
+        duration=str(trade.duration) if trade.duration is not None else None,
+        open_time=to_datetime(trade.open_time) if trade.open_time else None,
+        close_time=to_datetime(trade.close_time) if trade.close_time else None,
+        details=trade.details,
+        user_id=trade.user_id
+    )
     db.add(db_trade)
     db.commit()
     db.refresh(db_trade)
     return db_trade
 
 def get_trades_by_symbol(db: Session, symbol: str):
-    return db.query(TradeRecord).filter(TradeRecord.symbol == symbol).order_by(TradeRecord.close_time.desc()).all()
+    return db.query(TradeRecord).filter(TradeRecord.symbol == symbol).all()
