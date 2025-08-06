@@ -3,7 +3,7 @@ from fastapi import FastAPI, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
 from database import SessionLocal, engine
 import models
-from schemas import TradeSignalCreate, TradeSignalOut
+from schemas import TradeSignalCreate, TradeSignalOut, TradeRecordCreate, TradeRecordOut
 import crud
 from datetime import datetime
 
@@ -34,10 +34,37 @@ def post_signal(
     if user.username != "farm_robot":
         raise HTTPException(status_code=403, detail="Not authorized to POST signals")
 
-    # You may skip quota logic for the system user, or keep as needed
     signal.user_id = user.id
-    return crud.create_signal(db, signal)
+    signal.timestamp = datetime.utcnow()
+
+    # Upsert latest state per symbol (i.e., overwrite existing latest signal for this symbol)
+    created_signal = crud.upsert_latest_signal(db, signal)  # You must implement this in CRUD
+
+    return created_signal
 
 @app.get("/signals/{symbol}", response_model=TradeSignalOut)
 def get_signal(symbol: str, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    return crud.get_latest_signal(db, symbol)
+    # Return only the latest signal for the given symbol
+    latest_signal = crud.get_latest_signal(db, symbol)
+    if not latest_signal:
+        raise HTTPException(status_code=404, detail="No signal for this symbol")
+    return latest_signal
+
+@app.post("/trades", response_model=TradeRecordOut)
+def post_trade(
+    trade: TradeRecordCreate,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user)
+):
+    # Record a new closed trade (open/close, PnL, side, duration, etc)
+    # Allow both system and human users
+    trade.user_id = user.id
+    trade.timestamp = datetime.utcnow()
+    created_trade = crud.create_trade_record(db, trade)
+    return created_trade
+
+@app.get("/trades/{symbol}", response_model=list[TradeRecordOut])
+def get_trades(symbol: str, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    # Return all trades for this symbol (can add pagination later)
+    trades = crud.get_trades_by_symbol(db, symbol)
+    return trades
