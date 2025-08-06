@@ -30,17 +30,17 @@ def post_signal(
     db: Session = Depends(get_db),
     user=Depends(get_current_user)
 ):
-    # Only allow the 'system' user (AI bot) to POST signals
     if user.username != "farm_robot":
         raise HTTPException(status_code=403, detail="Not authorized to POST signals")
 
     signal.user_id = user.id
-    signal.timestamp = datetime.utcnow()
 
-    # Upsert latest state per symbol (i.e., overwrite existing latest signal for this symbol)
-    created_signal = crud.upsert_latest_signal(db, signal)  # You must implement this in CRUD
+    # 1. Save to history (all signals)
+    created_signal = crud.create_signal(db, signal)
+    # 2. Upsert latest (replace per symbol)
+    crud.upsert_latest_signal(db, signal)
 
-    return created_signal
+    return created_signal 
 
 @app.get("/signals/{symbol}", response_model=TradeSignalOut)
 def get_signal(symbol: str, db: Session = Depends(get_db), user=Depends(get_current_user)):
