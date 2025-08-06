@@ -68,3 +68,5 @@ def get_trades(symbol: str, db: Session = Depends(get_db), user=Depends(get_curr
     # Return all trades for this symbol (can add pagination later)
     trades = crud.get_trades_by_symbol(db, symbol)
     return trades
+
+ # Record
