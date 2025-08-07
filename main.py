@@ -24,6 +24,7 @@ def get_current_user(
     api_key: str = Cookie(None),
     db: Session = Depends(get_db)
 ):
+    print("api_key from cookie:", api_key)
     if not api_key:
         raise HTTPException(status_code=401, detail="Missing API Key")
     user = crud.get_user_by_api_key(db, api_key)
@@ -86,3 +87,7 @@ def get_all_trades(db: Session = Depends(get_db), user=Depends(get_current_user)
 @app.get("/debug_headers")
 async def debug_headers(request: Request):
     return dict(request.headers)
+
+@app.get("/debug_cookies")
+async def debug_cookies(request: Request):
+    return dict(request.cookies)
