@@ -8,6 +8,7 @@ import crud
 from datetime import datetime
 from typing import List
 from schemas import LatestSignalOut
+from fastapi import Cookie
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
@@ -20,15 +21,12 @@ def get_db():
         db.close()
 
 def get_current_user(
-    x_api_key: str = Header(None),
-    x_api_key_alt: str = Header(None, alias="x-api-key"),
+    api_key: str = Cookie(None),
     db: Session = Depends(get_db)
 ):
-    print(f"x_api_key: {x_api_key} | x_api_key_alt: {x_api_key_alt}")
-    key = x_api_key or x_api_key_alt
-    if not key:
-        raise HTTPException(status_code=401, detail="Invalid API Key")
-    user = crud.get_user_by_api_key(db, key)
+    if not api_key:
+        raise HTTPException(status_code=401, detail="Missing API Key")
+    user = crud.get_user_by_api_key(db, api_key)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid API Key")
     return user
