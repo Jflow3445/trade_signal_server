@@ -6,7 +6,8 @@ import models
 from schemas import TradeSignalCreate, TradeSignalOut, TradeRecordCreate, TradeRecordOut
 import crud
 from datetime import datetime
-
+from typing import List
+from schemas import LatestSignalOut
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
@@ -41,6 +42,14 @@ def post_signal(
     crud.upsert_latest_signal(db, signal)
 
     return created_signal 
+
+@app.get("/signals", response_model=List[LatestSignalOut])
+def get_all_latest_signals(
+    db: Session = Depends(get_db), 
+    user=Depends(get_current_user)
+):
+    # Return all latest signals for all symbols
+    return db.query(models.LatestSignal).order_by(models.LatestSignal.symbol.asc()).all()
 
 @app.get("/signals/{symbol}", response_model=TradeSignalOut)
 def get_signal(symbol: str, db: Session = Depends(get_db), user=Depends(get_current_user)):
