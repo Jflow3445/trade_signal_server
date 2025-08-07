@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from sqlalchemy.orm import Session
 from database import SessionLocal, engine
 import models
@@ -85,3 +85,6 @@ def post_trade(
 def get_all_trades(db: Session = Depends(get_db), user=Depends(get_current_user)):
     return db.query(models.TradeRecord).order_by(models.TradeRecord.id.desc()).all()
 
+@app.get("/debug_headers")
+async def debug_headers(request: Request):
+    return dict(request.headers)
