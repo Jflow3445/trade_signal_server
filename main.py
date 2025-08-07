@@ -63,10 +63,7 @@ def post_trade(
     created_trade = crud.create_trade_record(db, trade)
     return created_trade
 
-@app.get("/trades/{symbol}", response_model=list[TradeRecordOut])
-def get_trades(symbol: str, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    # Return all trades for this symbol (can add pagination later)
-    trades = crud.get_trades_by_symbol(db, symbol)
-    return trades
+@app.get("/trades", response_model=list[TradeRecordOut])
+def get_all_trades(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    return db.query(models.TradeRecord).order_by(models.TradeRecord.id.desc()).all()
 
- # Record
