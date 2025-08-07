@@ -24,6 +24,7 @@ def get_current_user(
     x_api_key_alt: str = Header(None, alias="x-api-key"),
     db: Session = Depends(get_db)
 ):
+    print(f"x_api_key: {x_api_key} | x_api_key_alt: {x_api_key_alt}")
     key = x_api_key or x_api_key_alt
     if not key:
         raise HTTPException(status_code=401, detail="Invalid API Key")
@@ -31,6 +32,7 @@ def get_current_user(
     if not user:
         raise HTTPException(status_code=401, detail="Invalid API Key")
     return user
+
 
 @app.post("/signals", response_model=TradeSignalOut)
 def post_signal(
