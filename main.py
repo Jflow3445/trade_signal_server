@@ -19,8 +19,15 @@ def get_db():
     finally:
         db.close()
 
-def get_current_user(x_api_key: str = Header(...), db: Session = Depends(get_db)):
-    user = crud.get_user_by_api_key(db, x_api_key)
+def get_current_user(
+    x_api_key: str = Header(None),
+    x_api_key_alt: str = Header(None, alias="x-api-key"),
+    db: Session = Depends(get_db)
+):
+    key = x_api_key or x_api_key_alt
+    if not key:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
+    user = crud.get_user_by_api_key(db, key)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid API Key")
     return user
