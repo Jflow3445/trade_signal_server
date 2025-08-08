@@ -26,7 +26,7 @@ def get_db():
         db.close()
 
 def require_admin(x_admin_key: str = Header(...)):
-    if x_admin_key != "YOUR_ADMIN_SECRET":  # <-- Set your real admin key here
+    if x_admin_key != "b0e216c8d199091f36aaada01a056211":  # <-- Set your real admin key here
         raise HTTPException(status_code=403, detail="Forbidden")
     return True
 
