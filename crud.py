@@ -4,6 +4,10 @@ from sqlalchemy import func
 from models import TradeSignal, User, LatestSignal, TradeRecord, Activation
 from schemas import TradeSignalCreate, TradeRecordCreate
 import secrets
+from schemas import EAOpenPosition
+import json
+import models
+from sqlalchemy import and_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 UTC = timezone.utc
 
@@ -16,6 +20,90 @@ def plan_defaults(plan: str) -> dict:
         return {"daily_quota": 3, "months_valid": 1}
     # free
     return {"daily_quota": 1, "months_valid": None}
+
+def upsert_open_position(db: Session, user_id: int, account_id: str, broker_server: str, hwid: str | None, p: EAOpenPosition) -> bool:
+    """Insert or update a single open position. Returns True if inserted/updated."""
+    row = db.query(models.OpenPosition).filter(
+        and_(
+            models.OpenPosition.user_id == user_id,
+            models.OpenPosition.account_id == account_id,
+            models.OpenPosition.broker_server == broker_server,
+            models.OpenPosition.ticket == p.ticket,
+        )
+    ).one_or_none()
+
+    changed = False
+    if row is None:
+        row = models.OpenPosition(
+            user_id=user_id,
+            account_id=account_id,
+            broker_server=broker_server,
+            hwid=hwid,
+            ticket=p.ticket,
+            symbol=p.symbol.upper(),
+            side=p.side.lower(),
+            volume=p.volume,
+            entry_price=p.entry_price,
+            sl=p.sl,
+            tp=p.tp,
+            open_time=p.open_time,
+            magic=p.magic,
+            comment=p.comment,
+            updated_at=datetime.utcnow(),
+        )
+        db.add(row)
+        changed = True
+    else:
+        # update fields if changed
+        def upd(attr, val):
+            nonlocal changed
+            if getattr(row, attr) != val:
+                setattr(row, attr, val)
+                changed = True
+
+        upd("hwid", hwid)
+        upd("symbol", p.symbol.upper())
+        upd("side", p.side.lower())
+        upd("volume", p.volume)
+        upd("entry_price", p.entry_price)
+        upd("sl", p.sl)
+        upd("tp", p.tp)
+        upd("open_time", p.open_time)
+        upd("magic", p.magic)
+        upd("comment", p.comment)
+        row.updated_at = datetime.utcnow()
+
+    if changed:
+        db.commit()
+    return changed
+
+def prune_open_positions(db: Session, user_id: int, account_id: str, broker_server: str, keep_tickets: set[str]) -> int:
+    """Delete any open positions not in keep_tickets for this user/account/server."""
+    q = db.query(models.OpenPosition).filter(
+        and_(
+            models.OpenPosition.user_id == user_id,
+            models.OpenPosition.account_id == account_id,
+            models.OpenPosition.broker_server == broker_server
+        )
+    )
+    removed = 0
+    for row in q.all():
+        if row.ticket not in keep_tickets:
+            db.delete(row)
+            removed += 1
+    if removed:
+        db.commit()
+    return removed
+
+def get_open_symbols(db: Session, user_id: int, account_id: str, broker_server: str) -> set[str]:
+    rows = db.query(models.OpenPosition.symbol).filter(
+        and_(
+            models.OpenPosition.user_id == user_id,
+            models.OpenPosition.account_id == account_id,
+            models.OpenPosition.broker_server == broker_server
+        )
+    ).all()
+    return { (r[0] or "").upper() for r in rows }
 
 def ensure_user(db: Session, email: str, username: str | None, plan: str, daily_quota_override: int | None) -> User:
     u = get_user_by_email(db, email)

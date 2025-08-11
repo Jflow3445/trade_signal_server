@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String, Float, DateTime, JSON, ForeignKe
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from database import Base
+from datetime import datetime
 
 class User(Base):
     __tablename__ = "users"
@@ -72,3 +73,30 @@ class TradeRecord(Base):
     close_time = Column(DateTime(timezone=True), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     details = Column(JSON, nullable=True)
+
+class OpenPosition(Base):
+    __tablename__ = "open_positions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True, nullable=False)
+
+    account_id = Column(String(64), index=True, nullable=False)
+    broker_server = Column(String(128), index=True, nullable=False)
+    hwid = Column(String(128), nullable=True)
+
+    ticket = Column(String(64), nullable=False)             # MT5 ticket as string
+    symbol = Column(String(32), nullable=False)
+    side = Column(String(8), nullable=False)                # 'buy'/'sell'
+    volume = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=False)
+    sl = Column(Float, nullable=True)
+    tp = Column(Float, nullable=True)
+    open_time = Column(DateTime, nullable=True)
+    magic = Column(Integer, nullable=True)
+    comment = Column(String(255), nullable=True)
+
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id","account_id","broker_server","ticket", name="uq_openpos_user_acct_server_ticket"),
+    )

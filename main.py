@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import datetime, timezone
 from typing import List
 
@@ -20,6 +21,9 @@ from schemas import (
     ValidateResponse,
     ActivationsList,
     ActivationOut,
+    EAOpenPosition,
+    EASyncRequest,
+    EASyncResponse,
 )
 
 models.Base.metadata.create_all(bind=engine)
@@ -73,7 +77,6 @@ def get_current_user(token: str = Depends(get_api_token), db: Session = Depends(
             raise HTTPException(status_code=401, detail="Token expired")
 
     return user
-
 
 def require_admin(x_admin_key: str = Header(...)):
     if x_admin_key != os.getenv("TRADE_SERVER_API_KEY", "b0e216c8d199091f36aaada01a056211"):
@@ -158,9 +161,51 @@ def read_activation_headers(
 ):
     return account_id, broker_server, hwid
 
-# ---------------- Signal Endpoints ----------------
+# ---------------- EA: sync open positions ----------------
+@app.post("/ea/positions/sync", response_model=EASyncResponse)
+def sync_positions(
+    payload: EASyncRequest,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+    act_hdrs=Depends(read_activation_headers)
+):
+    if user.username == "farm_robot":
+        raise HTTPException(status_code=403, detail="farm_account_cannot_sync")
+
+    account_id, broker_server, hwid = act_hdrs
+    if not account_id or not broker_server:
+        raise HTTPException(status_code=400, detail="Missing activation headers")
+
+    received = len(payload.positions)
+    upserted = 0
+    keep = set()
+
+    for p in payload.positions:
+        if not p.ticket or not p.symbol:
+            continue
+        ok = crud.upsert_open_position(
+            db, user.id, str(account_id), str(broker_server), str(hwid) if hwid else None, p
+        )
+        if ok:
+            upserted += 1
+        keep.add(p.ticket)
+
+    pruned = crud.prune_open_positions(db, user.id, str(account_id), str(broker_server), keep)
+    return EASyncResponse(received=received, upserted=upserted, pruned=pruned)
+
+# ---------------- Helpers ----------------
 ACTIONABLE = {"buy", "sell"}
 
+def _coerce_details(obj):
+    """Avoid 500s from Pydantic when details is a JSON string in DB."""
+    try:
+        if isinstance(obj.details, str):
+            obj.details = json.loads(obj.details)
+    except Exception:
+        # leave it as-is; not fatal
+        pass
+
+# ---------------- Signal Endpoints ----------------
 @app.post("/signals", response_model=TradeSignalOut)
 def post_signal(signal: TradeSignalCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
     if user.username != "farm_robot":
@@ -168,6 +213,7 @@ def post_signal(signal: TradeSignalCreate, db: Session = Depends(get_db), user=D
     signal.user_id = user.id
     created_signal = crud.create_signal(db, signal)
     crud.upsert_latest_signal(db, signal)
+    _coerce_details(created_signal)
     return created_signal
 
 @app.get("/signals", response_model=List[LatestSignalOut])
@@ -177,9 +223,10 @@ def get_all_latest_signals(
     user=Depends(get_current_user),
     act_hdrs=Depends(read_activation_headers)
 ):
+    account_id, broker_server, hwid = act_hdrs
+
     # Activation enforcement for non-farm users
     if user.username != "farm_robot":
-        account_id, broker_server, hwid = act_hdrs
         if not account_id or not broker_server:
             raise HTTPException(status_code=400, detail="Missing activation headers")
         ok, used, limit = crud.ensure_activation(db, user, str(account_id), str(broker_server), str(hwid) if hwid else None)
@@ -188,11 +235,19 @@ def get_all_latest_signals(
 
     # Fetch and partition
     all_signals = db.query(models.LatestSignal).order_by(models.LatestSignal.symbol.asc()).all()
+    for s in all_signals:
+        _coerce_details(s)
+
     actionable = [s for s in all_signals if (s.action or "").lower() in ACTIONABLE]
     maintenance = [s for s in all_signals if (s.action or "").lower() not in ACTIONABLE]
 
     actionable_count = len(actionable)
     remaining = crud.get_remaining_today(user)
+
+    # Determine open symbols for this user/account (for maintenance filtering)
+    open_symbols = set()
+    if user.username != "farm_robot" and account_id and broker_server:
+        open_symbols = crud.get_open_symbols(db, user.id, str(account_id), str(broker_server))
 
     # Decide delivery + consume
     deliver_actionable = actionable
@@ -210,11 +265,13 @@ def get_all_latest_signals(
         # consume only how many actionable we return
         if to_consume > 0:
             if not crud.consume_n(db, user, to_consume):
-                # Safety: if another concurrent request consumed quota, fallback to maintenance only
                 deliver_actionable = []
                 to_consume = 0
 
-    out = deliver_actionable + maintenance
+    # Always filter maintenance to only the user's open symbols
+    filtered_maintenance = [m for m in maintenance if (m.symbol or "").upper() in open_symbols] if open_symbols else maintenance
+
+    out = deliver_actionable + filtered_maintenance
 
     # headers
     response.headers["X-Quota-Daily"] = str(user.daily_quota) if user.daily_quota is not None else "unlimited"
@@ -236,8 +293,9 @@ def get_signal(
     user=Depends(get_current_user),
     act_hdrs=Depends(read_activation_headers)
 ):
+    account_id, broker_server, hwid = act_hdrs
+
     if user.username != "farm_robot":
-        account_id, broker_server, hwid = act_hdrs
         if not account_id or not broker_server:
             raise HTTPException(status_code=400, detail="Missing activation headers")
         ok, used, limit = crud.ensure_activation(db, user, str(account_id), str(broker_server), str(hwid) if hwid else None)
@@ -247,6 +305,8 @@ def get_signal(
     latest_signal = crud.get_latest_signal(db, symbol)
     if not latest_signal:
         raise HTTPException(status_code=404, detail="No signal for this symbol")
+
+    _coerce_details(latest_signal)
 
     # Count/consume only if actionable
     is_actionable = (latest_signal.action or "").lower() in ACTIONABLE
@@ -274,7 +334,8 @@ def get_signal(
 def post_trade(trade: TradeRecordCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
     trade.user_id = user.id
     trade.timestamp = datetime.utcnow()
-    return crud.create_trade_record(db, trade)
+    created = crud.create_trade_record(db, trade)
+    return created
 
 @app.get("/trades", response_model=List[TradeRecordOut])
 def get_all_trades(db: Session = Depends(get_db), user=Depends(get_current_user)):
@@ -288,6 +349,10 @@ async def debug_headers(request: Request):
 @app.get("/debug_cookies")
 async def debug_cookies(request: Request):
     return dict(request.cookies)
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
 @app.get("/me")
 def me(user=Depends(get_current_user)):
