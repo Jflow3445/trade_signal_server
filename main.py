@@ -66,10 +66,10 @@ def admin_issue_token(
     user = crud.issue_or_rotate_token(
         db,
         email=req.email,
-        username=req.username or req.email.split("@")[0],
+        username=req.username,
         plan=req.plan.lower(),
         daily_quota_override=req.daily_quota,
-        months_valid=req.months_valid
+        months_valid=(req.months_valid if req.months_valid is not None else getattr(req, "months", None))
     )
     return AdminIssueTokenResponse(
         email=user.email,

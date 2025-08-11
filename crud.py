@@ -10,10 +10,42 @@ UTC = timezone.utc
 # ---------- Plan rules ----------
 def plan_defaults(plan: str) -> dict:
     p = (plan or "free").lower()
-    if p == "gold":   return {"daily_quota": None, "months_valid": 1}  # unlimited per day, monthly rotation
-    if p == "silver": return {"daily_quota": 3,    "months_valid": 1}
-    return {"daily_quota": 1, "months_valid": None}  # free: no expiry by month
+    if p == "gold":
+        return {"daily_quota": None, "months_valid": 1}
+    if p == "silver":
+        return {"daily_quota": 3, "months_valid": 1}
+    # free
+    return {"daily_quota": 1, "months_valid": None}
 
+def ensure_user(db: Session, email: str, username: str | None, plan: str, daily_quota_override: int | None) -> User:
+    u = get_user_by_email(db, email)
+    defaults = plan_defaults(plan)
+    dq = daily_quota_override if daily_quota_override is not None else defaults["daily_quota"]
+    if not u:
+        u = User(
+            email=email,
+            username=(username or email.split("@")[0]),
+            plan=plan,
+            tier=plan,
+            daily_quota=dq,
+            quota=dq,  # keep legacy column in sync
+            is_active=True,
+            used_today=0,
+            usage_reset_at=datetime.now(UTC),
+            expires_at=(None if defaults["months_valid"] is None else datetime.now(UTC) + timedelta(days=30 * defaults["months_valid"]))
+        )
+        db.add(u)
+        db.commit()
+        db.refresh(u)
+    else:
+        u.plan = plan
+        u.tier = plan
+        u.daily_quota = dq
+        u.quota = dq
+        # don't change expires_at here; rotation path below sets it explicitly
+        db.commit()
+        db.refresh(u)
+    return u
 def plan_activation_limit(plan: str):
     p = (plan or "free").lower()
     if p == "gold":   return 3
@@ -72,44 +104,37 @@ def issue_or_rotate_token(
     user = get_user_by_email(db, email)
     defaults = plan_defaults(plan)
     dq = daily_quota_override if daily_quota_override is not None else defaults["daily_quota"]
-    months_valid = defaults["months_valid"] if months_valid is None else months_valid
-    expires = None if (plan == "free" or months_valid is None) else datetime.now(UTC) + timedelta(days=30 * months_valid)
+    # Decide final months_valid: if caller passes None, use default
+    mv = defaults["months_valid"] if months_valid is None else months_valid
+    expires = None if (plan.lower() == "free" or mv is None) else datetime.now(UTC) + timedelta(days=30 * mv)
 
     if not user:
-        api_key = secrets.token_hex(16)
         user = User(
             email=email,
             username=username or email.split("@")[0],
-            api_key=api_key,
+            api_key=secrets.token_hex(16),
             plan=plan,
-            tier=plan,
             daily_quota=dq,
-            quota=dq if dq is not None else 0,
             used_today=0,
             usage_reset_at=datetime.now(UTC),
             expires_at=expires,
-            is_active=True,
+            is_active=True
         )
         db.add(user)
         db.commit()
         db.refresh(user)
         return user
 
-    # rotate
+    # rotate token and update
     user.api_key = secrets.token_hex(16)
     user.plan = plan
-    user.tier = plan
     user.daily_quota = dq
-    user.quota = dq if dq is not None else 0
     user.used_today = 0
     user.usage_reset_at = datetime.now(UTC)
     user.expires_at = expires
     user.is_active = True
     db.commit()
     db.refresh(user)
-
-    # reset activations each rotation
-    clear_activations_for_user(db, user.id)
     return user
 
 # ---------- Activations ----------
@@ -165,12 +190,12 @@ def create_signal(db: Session, signal: TradeSignalCreate):
     return db_signal
 
 def upsert_latest_signal(db: Session, signal: TradeSignalCreate):
-    from datetime import datetime as dt
+    from datetime import datetime as dt, timezone
     db_signal = db.query(LatestSignal).filter(LatestSignal.symbol == signal.symbol).first()
     if db_signal:
         for field, value in signal.dict().items():
             setattr(db_signal, field, value)
-        db_signal.updated_at = dt.utcnow()
+        db_signal.updated_at = dt.now(timezone.utc)
     else:
         db_signal = LatestSignal(**signal.dict())
         db.add(db_signal)
