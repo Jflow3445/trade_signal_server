@@ -35,13 +35,36 @@ def get_db():
         db.close()
 
 # ---------------- Auth Helpers ----------------
-def get_current_user(api_key: str = Query(None), db: Session = Depends(get_db)):
-    if not api_key:
+def get_api_token(
+    authorization: str = Header(None),
+    api_key: str = Query(None)
+) -> str:
+    token = None
+
+    # Header first
+    if authorization:
+        parts = authorization.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token = parts[1].strip()
+
+    # Fallback to query
+    if not token and api_key:
+        token = api_key.strip()
+
+    # Strip <...> if user pasted with angle brackets
+    if token and token.startswith("<") and token.endswith(">"):
+        token = token[1:-1].strip()
+
+    if not token:
         raise HTTPException(status_code=401, detail="Missing API token")
-    user = crud.get_user_by_api_key(db, api_key)
+    return token
+
+def get_current_user(token: str = Depends(get_api_token), db: Session = Depends(get_db)):
+    user = crud.get_user_by_api_key(db, token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid API token")
 
+    # Keep your existing non-farm checks
     if user.username != "farm_robot":
         if not user.is_active:
             raise HTTPException(status_code=403, detail="Account inactive")
@@ -50,6 +73,7 @@ def get_current_user(api_key: str = Query(None), db: Session = Depends(get_db)):
             raise HTTPException(status_code=401, detail="Token expired")
 
     return user
+
 
 def require_admin(x_admin_key: str = Header(...)):
     if x_admin_key != os.getenv("TRADE_SERVER_API_KEY", "b0e216c8d199091f36aaada01a056211"):
