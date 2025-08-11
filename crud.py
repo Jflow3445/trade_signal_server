@@ -4,7 +4,7 @@ from sqlalchemy import func
 from models import TradeSignal, User, LatestSignal, TradeRecord, Activation
 from schemas import TradeSignalCreate, TradeRecordCreate
 import secrets
-
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 UTC = timezone.utc
 
 # ---------- Plan rules ----------
@@ -148,35 +148,40 @@ def find_activation(db: Session, user_id: int, account_id: str, broker_server: s
         Activation.broker_server == broker_server
     ).first()
 
-def ensure_activation(db: Session, user: User, account_id: str, broker_server: str, hwid: str | None):
+def ensure_activation(db, user, account_id: str, broker_server: str, hwid: str | None):
     if user.username == "farm_robot":
-        return True, 0, None  # no limits for farm poster
+        return True, 0, None
 
     limit = plan_activation_limit(user.plan)
-    used = count_activations(db, user.id)
+    used  = count_activations(db, user.id)
 
+    # Already at limit? bail early unless it already exists
     existing = find_activation(db, user.id, account_id, broker_server)
-    if existing:
-        existing.last_seen_at = datetime.now(UTC)
-        if hwid and not existing.hwid:
-            existing.hwid = hwid
-        db.commit()
-        return True, used, limit
-
-    if used >= (limit or 0):
+    if not existing and used >= (limit or 0):
         return False, used, limit
 
-    a = Activation(
-        user_id=user.id,
-        account_id=account_id,
-        broker_server=broker_server,
-        hwid=hwid,
-        created_at=datetime.now(UTC),
-        last_seen_at=datetime.now(UTC),
+    stmt = (
+        pg_insert(Activation)
+        .values(
+            user_id=user.id,
+            account_id=account_id,
+            broker_server=broker_server,
+            hwid=hwid,
+            created_at=func.now(),
+            last_seen_at=func.now(),
+        )
+        .on_conflict_do_update(
+            index_elements=[Activation.user_id, Activation.account_id, Activation.broker_server],
+            set_={
+                "last_seen_at": func.now(),
+                "hwid": func.coalesce(Activation.hwid, hwid),
+            },
+        )
     )
-    db.add(a)
+    db.execute(stmt)
     db.commit()
-    return True, used + 1, limit
+    # If it already existed, 'used' didn’t increase
+    return True, (used if existing else used + 1), limit
 
 def list_activations(db: Session, user_id: int):
     return db.query(Activation).filter(Activation.user_id == user_id).order_by(Activation.created_at.asc()).all()
