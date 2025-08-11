@@ -1,79 +1,64 @@
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
-from models import TradeSignal, User, LatestSignal, TradeRecord
+from sqlalchemy import func
+from models import TradeSignal, User, LatestSignal, TradeRecord, Activation
 from schemas import TradeSignalCreate, TradeRecordCreate
 import secrets
-from typing import Optional, Tuple
 
 UTC = timezone.utc
 
-# ---------- Users ----------
+# ---------- Plan rules ----------
+def plan_defaults(plan: str) -> dict:
+    p = (plan or "free").lower()
+    if p == "gold":   return {"daily_quota": None, "months_valid": 1}  # unlimited per day, monthly rotation
+    if p == "silver": return {"daily_quota": 3,    "months_valid": 1}
+    return {"daily_quota": 1, "months_valid": None}  # free: no expiry by month
 
-def get_user_by_api_key(db: Session, api_key: str) -> Optional[User]:
+def plan_activation_limit(plan: str):
+    p = (plan or "free").lower()
+    if p == "gold":   return 3
+    if p == "silver": return 1
+    return 1  # free
+
+# ---------- Users ----------
+def get_user_by_api_key(db: Session, api_key: str):
     return db.query(User).filter(User.api_key == api_key).first()
 
-def get_user_by_email(db: Session, email: str) -> Optional[User]:
+def get_user_by_email(db: Session, email: str):
     return db.query(User).filter(User.email == email).first()
 
 def ensure_daily_reset(user: User) -> None:
     now = datetime.now(UTC)
-    # daily reset keyed by date (UTC)
     if not user.usage_reset_at or user.usage_reset_at.date() != now.date():
         user.used_today = 0
         user.usage_reset_at = now
 
-def plan_defaults(plan: str) -> dict:
-    """
-    Return default limits for a plan.
-    - free: 1/day, no expiry
-    - silver: 3/day, 1 month expiry
-    - gold: unlimited/day, 1 month expiry
-    """
-    p = (plan or "free").lower()
-    if p == "gold":
-        return {"daily_quota": None, "months_valid": 1}
-    if p == "silver":
-        return {"daily_quota": 3, "months_valid": 1}
-    # free
-    return {"daily_quota": 1, "months_valid": None}
+def get_remaining_today(user: User):
+    if user.username == "farm_robot":
+        return None
+    ensure_daily_reset(user)
+    if user.daily_quota is None:
+        return None
+    return max(0, int(user.daily_quota) - int(user.used_today))
 
-def ensure_user(
-    db: Session,
-    email: str,
-    username: Optional[str],
-    plan: str,
-    daily_quota_override: Optional[int]
-) -> User:
-    u = get_user_by_email(db, email)
-    defaults = plan_defaults(plan)
-    dq = daily_quota_override if daily_quota_override is not None else defaults["daily_quota"]
+def consume_n(db: Session, user: User, n: int) -> bool:
+    if n <= 0:
+        return True
+    if user.username == "farm_robot":
+        return True
+    ensure_daily_reset(user)
+    if user.daily_quota is None:
+        return True
+    if user.used_today + n > user.daily_quota:
+        return False
+    user.used_today += n
+    db.commit()
+    db.refresh(user)
+    return True
 
-    if not u:
-        u = User(
-            email=email,
-            username=username or email.split("@")[0],
-            plan=plan,
-            tier=plan,
-            daily_quota=dq,
-            quota=dq if dq is not None else None,
-            is_active=True,
-            used_today=0,
-            usage_reset_at=datetime.now(UTC),
-            expires_at=None if defaults["months_valid"] is None
-                        else (datetime.now(UTC) + timedelta(days=30 * defaults["months_valid"]))
-        )
-        # also create an api_key so /me works if needed
-        u.api_key = secrets.token_hex(16)
-        db.add(u)
-        db.commit()
-        db.refresh(u)
-    else:
-        u.plan = plan
-        u.tier = plan
-        u.daily_quota = dq
-        u.quota = dq if dq is not None else None
-        db.commit()
-    return u
+def clear_activations_for_user(db: Session, user_id: int):
+    db.query(Activation).filter(Activation.user_id == user_id).delete(synchronize_session=False)
+    db.commit()
 
 def issue_or_rotate_token(
     db: Session,
@@ -81,106 +66,97 @@ def issue_or_rotate_token(
     email: str,
     username: str,
     plan: str,
-    daily_quota_override: Optional[int] = None,
-    months_valid: Optional[int] = 1
+    daily_quota_override: int | None = None,
+    months_valid: int | None = 1
 ) -> User:
     user = get_user_by_email(db, email)
     defaults = plan_defaults(plan)
     dq = daily_quota_override if daily_quota_override is not None else defaults["daily_quota"]
-    mv = defaults["months_valid"] if months_valid is None else months_valid
-
-    expires = None if (plan == "free" or mv is None) else datetime.now(UTC) + timedelta(days=30 * mv)
+    months_valid = defaults["months_valid"] if months_valid is None else months_valid
+    expires = None if (plan == "free" or months_valid is None) else datetime.now(UTC) + timedelta(days=30 * months_valid)
 
     if not user:
-        # create new
+        api_key = secrets.token_hex(16)
         user = User(
             email=email,
-            username=username,
-            api_key=secrets.token_hex(16),
+            username=username or email.split("@")[0],
+            api_key=api_key,
             plan=plan,
+            tier=plan,
             daily_quota=dq,
+            quota=dq if dq is not None else 0,
             used_today=0,
             usage_reset_at=datetime.now(UTC),
             expires_at=expires,
             is_active=True,
-            tier=plan,
-            quota=dq if dq is not None else None
         )
         db.add(user)
         db.commit()
         db.refresh(user)
         return user
 
-    # rotate token & update limits/expiry
+    # rotate
     user.api_key = secrets.token_hex(16)
     user.plan = plan
     user.tier = plan
     user.daily_quota = dq
-    user.quota = dq if dq is not None else None
-    user.expires_at = expires
-    user.is_active = True
+    user.quota = dq if dq is not None else 0
     user.used_today = 0
     user.usage_reset_at = datetime.now(UTC)
+    user.expires_at = expires
+    user.is_active = True
     db.commit()
     db.refresh(user)
+
+    # reset activations each rotation
+    clear_activations_for_user(db, user.id)
     return user
 
-def remaining_today(user: User) -> Optional[int]:
-    """Return remaining actionable count today. None => unlimited."""
-    ensure_daily_reset(user)
-    if user.daily_quota is None:
-        return None
-    return max(0, int(user.daily_quota) - int(user.used_today or 0))
+# ---------- Activations ----------
+def count_activations(db: Session, user_id: int) -> int:
+    return db.query(func.count(Activation.id)).filter(Activation.user_id == user_id).scalar() or 0
 
-def consume(db: Session, user: User, count: int) -> None:
-    """Consume count actionable uses (no-op if unlimited)."""
-    ensure_daily_reset(user)
-    if user.daily_quota is None:
-        return
-    user.used_today = int(user.used_today or 0) + int(count)
-    db.commit()
-    db.refresh(user)
+def find_activation(db: Session, user_id: int, account_id: str, broker_server: str):
+    return db.query(Activation).filter(
+        Activation.user_id == user_id,
+        Activation.account_id == account_id,
+        Activation.broker_server == broker_server
+    ).first()
 
-def validate_and_consume(
-    db: Session,
-    *,
-    email: str,
-    api_key: str,
-    count: int = 1
-) -> Tuple[bool, Optional[User], Optional[str]]:
-    user = get_user_by_email(db, email)
-    if not user or user.api_key != api_key:
-        return False, None, "invalid_credentials"
-
-    # farm_robot never limited
+def ensure_activation(db: Session, user: User, account_id: str, broker_server: str, hwid: str | None):
     if user.username == "farm_robot":
-        return True, user, None
+        return True, 0, None  # no limits for farm poster
 
-    if not user.is_active:
-        return False, None, "inactive"
+    limit = plan_activation_limit(user.plan)
+    used = count_activations(db, user.id)
 
-    now = datetime.now(UTC)
-    if user.expires_at and user.expires_at <= now:
-        return False, None, "expired"
+    existing = find_activation(db, user.id, account_id, broker_server)
+    if existing:
+        existing.last_seen_at = datetime.now(UTC)
+        if hwid and not existing.hwid:
+            existing.hwid = hwid
+        db.commit()
+        return True, used, limit
 
-    ensure_daily_reset(user)
+    if used >= (limit or 0):
+        return False, used, limit
 
-    # unlimited
-    if user.daily_quota is None:
-        return True, user, None
-
-    used = int(user.used_today or 0)
-    quota = int(user.daily_quota)
-    if used + count > quota:
-        return False, user, "quota_exhausted"
-
-    user.used_today = used + count
+    a = Activation(
+        user_id=user.id,
+        account_id=account_id,
+        broker_server=broker_server,
+        hwid=hwid,
+        created_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    db.add(a)
     db.commit()
-    db.refresh(user)
-    return True, user, None
+    return True, used + 1, limit
+
+def list_activations(db: Session, user_id: int):
+    return db.query(Activation).filter(Activation.user_id == user_id).order_by(Activation.created_at.asc()).all()
 
 # ---------- Signals ----------
-
 def create_signal(db: Session, signal: TradeSignalCreate):
     db_signal = TradeSignal(**signal.dict())
     db.add(db_signal)
@@ -206,7 +182,6 @@ def get_latest_signal(db: Session, symbol: str):
     return db.query(LatestSignal).filter(LatestSignal.symbol == symbol).first()
 
 # ---------- Trades ----------
-
 def create_trade_record(db: Session, trade: TradeRecordCreate) -> TradeRecord:
     from datetime import datetime as dt
     def to_datetime(val):

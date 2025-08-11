@@ -1,8 +1,6 @@
 import os
-import secrets
 from datetime import datetime, timezone
 from typing import List
-from enum import Enum
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, Query, Body, Response
 from sqlalchemy.orm import Session
@@ -20,6 +18,8 @@ from schemas import (
     AdminIssueTokenResponse,
     ValidateRequest,
     ValidateResponse,
+    ActivationsList,
+    ActivationOut,
 )
 
 models.Base.metadata.create_all(bind=engine)
@@ -42,7 +42,6 @@ def get_current_user(api_key: str = Query(None), db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid API token")
 
-    # Apply expiry/active checks for non-farm users
     if user.username != "farm_robot":
         if not user.is_active:
             raise HTTPException(status_code=403, detail="Account inactive")
@@ -56,10 +55,6 @@ def require_admin(x_admin_key: str = Header(...)):
     if x_admin_key != os.getenv("TRADE_SERVER_API_KEY", "b0e216c8d199091f36aaada01a056211"):
         raise HTTPException(status_code=403, detail="Forbidden")
     return True
-
-# Utility
-def _is_actionable(action: str) -> bool:
-    return (action or "").lower() in ("buy", "sell")
 
 # ---------------- Admin: Issue/Renew Token ----------------
 @app.post("/admin/tokens/issue", response_model=AdminIssueTokenResponse)
@@ -80,32 +75,67 @@ def admin_issue_token(
         email=user.email,
         username=user.username,
         plan=user.plan,
-        token=user.api_key,          # keep "token" for backwards compatibility
+        token=user.api_key,
         api_key=user.api_key,
         daily_quota=user.daily_quota,
         expires_at=user.expires_at,
         is_active=user.is_active
     )
 
+# (Optional) Admin view activations for a user
+@app.get("/admin/activations", response_model=ActivationsList)
+def admin_activations(
+    email: str,
+    db: Session = Depends(get_db),
+    admin_ok: bool = Depends(require_admin)
+):
+    user = crud.get_user_by_email(db, email)
+    if not user:
+        raise HTTPException(status_code=404, detail="No such user")
+    items = crud.list_activations(db, user.id)
+    return ActivationsList(
+        email=email,
+        plan=user.plan or "free",
+        used=len(items),
+        limit=crud.plan_activation_limit(user.plan),
+        items=[ActivationOut.from_orm(a) for a in items]
+    )
+
 # ---------------- EA Validate (and consume quota) ----------------
 @app.post("/auth/validate", response_model=ValidateResponse)
 def validate(req: ValidateRequest, db: Session = Depends(get_db)):
-    ok, user, reason = crud.validate_and_consume(db, email=req.email, api_key=req.api_key, count=1)
-    if not ok:
-        raise HTTPException(status_code=401, detail=reason or "Unauthorized")
+    # reuse the /signals flow logic: only counts actionable
+    user = crud.get_user_by_email(db, req.email)
+    if not user or user.api_key != req.api_key:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    remaining = crud.remaining_today(user)
-    # remaining None => unlimited
+    if user.username != "farm_robot":
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="Account inactive")
+        now = datetime.now(timezone.utc)
+        if user.expires_at and user.expires_at <= now:
+            raise HTTPException(status_code=401, detail="Token expired")
+
+    remaining = crud.get_remaining_today(user)
     return ValidateResponse(
         ok=True,
         plan=user.plan or "free",
         daily_quota=user.daily_quota,
-        remaining_today=remaining,
+        remaining_today=remaining if remaining is not None else None,
         expires_at=user.expires_at,
-        is_active=user.is_active
+        is_active=user.is_active,
     )
 
+# ---------------- Parse activation headers ----------------
+def read_activation_headers(
+    account_id: str = Header(None, alias="X-Account-Id"),
+    broker_server: str = Header(None, alias="X-Broker-Server"),
+    hwid: str = Header(None, alias="X-Hwid")
+):
+    return account_id, broker_server, hwid
+
 # ---------------- Signal Endpoints ----------------
+ACTIONABLE = {"buy", "sell"}
 
 @app.post("/signals", response_model=TradeSignalOut)
 def post_signal(signal: TradeSignalCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
@@ -120,83 +150,98 @@ def post_signal(signal: TradeSignalCreate, db: Session = Depends(get_db), user=D
 def get_all_latest_signals(
     response: Response,
     db: Session = Depends(get_db),
-    user=Depends(get_current_user)
+    user=Depends(get_current_user),
+    act_hdrs=Depends(read_activation_headers)
 ):
-    # Always get the canonical, ordered list
-    latest: List[models.LatestSignal] = (
-        db.query(models.LatestSignal).order_by(models.LatestSignal.symbol.asc()).all()
-    )
-
-    if user.username == "farm_robot":
-        # Bot: no limits
-        return latest
-
-    # Split actionable/non-actionable
-    # We will return ALL non-actionable (modifications etc.) without counting,
-    # and up to N actionable where N = remaining_today (None => unlimited).
-    remaining = crud.remaining_today(user)  # None => unlimited
-    actionable_left = float("inf") if remaining is None else int(remaining)
-
-    filtered: List[models.LatestSignal] = []
-    consumed = 0
-
-    for s in latest:
-        if _is_actionable(s.action):
-            if actionable_left > 0:
-                filtered.append(s)
-                consumed += 1
-                if actionable_left != float("inf"):
-                    actionable_left -= 1
-            else:
-                # skip extra actionable beyond quota
-                continue
-        else:
-            # keep non-actionable always
-            filtered.append(s)
-
-    # Consume only the number of actionable items we actually returned
-    if consumed > 0 and remaining is not None:
-        ok, _, reason = crud.validate_and_consume(
-            db, email=user.email or user.username, api_key=user.api_key, count=consumed
-        )
+    # Activation enforcement for non-farm users
+    if user.username != "farm_robot":
+        account_id, broker_server, hwid = act_hdrs
+        if not account_id or not broker_server:
+            raise HTTPException(status_code=400, detail="Missing activation headers")
+        ok, used, limit = crud.ensure_activation(db, user, str(account_id), str(broker_server), str(hwid) if hwid else None)
         if not ok:
-            # In case of race or double-consume, just block
-            raise HTTPException(status_code=429, detail=reason or "Rate limited")
+            raise HTTPException(status_code=403, detail="activation_limit")
 
-    # Expose helpful headers
-    new_remaining = crud.remaining_today(user)
+    # Fetch and partition
+    all_signals = db.query(models.LatestSignal).order_by(models.LatestSignal.symbol.asc()).all()
+    actionable = [s for s in all_signals if (s.action or "").lower() in ACTIONABLE]
+    maintenance = [s for s in all_signals if (s.action or "").lower() not in ACTIONABLE]
+
+    actionable_count = len(actionable)
+    remaining = crud.get_remaining_today(user)
+
+    # Decide delivery + consume
+    deliver_actionable = actionable
+    to_consume = actionable_count
+
+    if user.username != "farm_robot":
+        if remaining is not None:
+            if remaining <= 0:
+                deliver_actionable = []
+                to_consume = 0
+            elif remaining < actionable_count:
+                deliver_actionable = actionable[:remaining]
+                to_consume = remaining
+
+        # consume only how many actionable we return
+        if to_consume > 0:
+            if not crud.consume_n(db, user, to_consume):
+                # Safety: if another concurrent request consumed quota, fallback to maintenance only
+                deliver_actionable = []
+                to_consume = 0
+
+    out = deliver_actionable + maintenance
+
+    # headers
     response.headers["X-Quota-Daily"] = str(user.daily_quota) if user.daily_quota is not None else "unlimited"
-    response.headers["X-Quota-Remaining"] = str(new_remaining) if new_remaining is not None else "unlimited"
-    response.headers["X-Actionable-Returned"] = str(consumed)
+    rem_after = crud.get_remaining_today(user)
+    response.headers["X-Quota-Remaining"] = str(rem_after) if rem_after is not None else "unlimited"
+    response.headers["X-Actionable-Returned"] = str(len(deliver_actionable))
+    if user.username != "farm_robot":
+        response.headers["X-Activations-Used"] = str(crud.count_activations(db, user.id))
+        lim = crud.plan_activation_limit(user.plan)
+        response.headers["X-Activations-Limit"] = str(lim) if lim is not None else "unlimited"
 
-    return filtered
+    return out
 
 @app.get("/signals/{symbol}", response_model=TradeSignalOut)
 def get_signal(
     symbol: str,
     response: Response,
     db: Session = Depends(get_db),
-    user=Depends(get_current_user)
+    user=Depends(get_current_user),
+    act_hdrs=Depends(read_activation_headers)
 ):
+    if user.username != "farm_robot":
+        account_id, broker_server, hwid = act_hdrs
+        if not account_id or not broker_server:
+            raise HTTPException(status_code=400, detail="Missing activation headers")
+        ok, used, limit = crud.ensure_activation(db, user, str(account_id), str(broker_server), str(hwid) if hwid else None)
+        if not ok:
+            raise HTTPException(status_code=403, detail="activation_limit")
+
     latest_signal = crud.get_latest_signal(db, symbol)
     if not latest_signal:
         raise HTTPException(status_code=404, detail="No signal for this symbol")
 
-    if user.username != "farm_robot":
-        if _is_actionable(latest_signal.action):
-            # Need at least 1 remaining to serve this actionable
-            ok, _, reason = crud.validate_and_consume(
-                db, email=user.email or user.username, api_key=user.api_key, count=1
-            )
-            if not ok:
-                raise HTTPException(status_code=429, detail=reason or "Rate limited")
-        # Non-actionable: do not consume
+    # Count/consume only if actionable
+    is_actionable = (latest_signal.action or "").lower() in ACTIONABLE
+    if user.username != "farm_robot" and is_actionable:
+        remaining = crud.get_remaining_today(user)
+        if remaining is not None and remaining <= 0:
+            raise HTTPException(status_code=429, detail="Access blocked: quota_exhausted")
+        if not crud.consume_n(db, user, 1):
+            raise HTTPException(status_code=429, detail="Access blocked: quota_exhausted")
 
-        # Helpful headers
-        rem = crud.remaining_today(user)
-        response.headers["X-Quota-Daily"] = str(user.daily_quota) if user.daily_quota is not None else "unlimited"
-        response.headers["X-Quota-Remaining"] = str(rem) if rem is not None else "unlimited"
-        response.headers["X-Actionable-Returned"] = "1" if _is_actionable(latest_signal.action) else "0"
+    # headers
+    response.headers["X-Quota-Daily"] = str(user.daily_quota) if user.daily_quota is not None else "unlimited"
+    rem_after = crud.get_remaining_today(user)
+    response.headers["X-Quota-Remaining"] = str(rem_after) if rem_after is not None else "unlimited"
+    response.headers["X-Actionable-Returned"] = "1" if is_actionable else "0"
+    if user.username != "farm_robot":
+        response.headers["X-Activations-Used"] = str(crud.count_activations(db, user.id))
+        lim = crud.plan_activation_limit(user.plan)
+        response.headers["X-Activations-Limit"] = str(lim) if lim is not None else "unlimited"
 
     return latest_signal
 

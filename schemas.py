@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List
 from datetime import datetime
 
 # ===== Signals =====
@@ -54,16 +54,17 @@ class TradeRecordOut(TradeRecordBase):
 class AdminIssueTokenRequest(BaseModel):
     email: EmailStr
     username: Optional[str] = None
-    plan: str                 # "free" | "silver" | "gold"
-    months: int = 1           # validity window for non-free
+    plan: str
+    months: int = 1
     daily_quota: Optional[int] = None
+    months_valid: Optional[int] = 1
 
 class AdminIssueTokenResponse(BaseModel):
     email: EmailStr
     username: str
     plan: str
-    token: str                # = api_key (alias for clarity to WP/EA)
-    api_key: str              # kept for backward-compat
+    token: str
+    api_key: str
     daily_quota: Optional[int]
     expires_at: Optional[datetime]
     is_active: bool
@@ -72,7 +73,6 @@ class AdminIssueTokenResponse(BaseModel):
 class ValidateRequest(BaseModel):
     email: EmailStr
     api_key: str
-    consume: Optional[bool] = False  # if true, decrement the daily quota
 
 class ValidateResponse(BaseModel):
     ok: bool
@@ -82,3 +82,20 @@ class ValidateResponse(BaseModel):
     expires_at: Optional[datetime] = None
     is_active: Optional[bool] = None
     reason: Optional[str] = None
+
+# ===== Admin (optional) view activations =====
+class ActivationOut(BaseModel):
+    account_id: str
+    broker_server: str
+    hwid: Optional[str] = None
+    created_at: datetime
+    last_seen_at: datetime
+    class Config:
+        orm_mode = True
+
+class ActivationsList(BaseModel):
+    email: EmailStr
+    plan: str
+    used: int
+    limit: Optional[int]
+    items: List[ActivationOut]
