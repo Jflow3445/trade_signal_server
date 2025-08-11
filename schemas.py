@@ -53,27 +53,32 @@ class TradeRecordOut(TradeRecordBase):
 # ===== Admin token issue/renew =====
 class AdminIssueTokenRequest(BaseModel):
     email: EmailStr
-    username: str
-    plan: str  # free|silver|gold
-    # optional overrides
+    username: Optional[str] = None
+    plan: str                 # "free" | "silver" | "gold"
+    months: int = 1           # validity window for non-free
     daily_quota: Optional[int] = None
-    months_valid: Optional[int] = 1  # free can be None => no expiry
 
 class AdminIssueTokenResponse(BaseModel):
     email: EmailStr
     username: str
     plan: str
-    api_key: str
+    token: str                # = api_key (alias for clarity to WP/EA)
+    api_key: str              # kept for backward-compat
     daily_quota: Optional[int]
     expires_at: Optional[datetime]
+    is_active: bool
 
 # ===== EA validate =====
 class ValidateRequest(BaseModel):
     email: EmailStr
     api_key: str
+    consume: Optional[bool] = False  # if true, decrement the daily quota
 
 class ValidateResponse(BaseModel):
     ok: bool
-    plan: str
-    remaining_today: Optional[int]  # None => unlimited
-    expires_at: Optional[datetime]
+    plan: Optional[str] = None
+    daily_quota: Optional[int] = None
+    remaining_today: Optional[int] = None
+    expires_at: Optional[datetime] = None
+    is_active: Optional[bool] = None
+    reason: Optional[str] = None
