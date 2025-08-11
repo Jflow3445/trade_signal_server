@@ -1,11 +1,11 @@
 import os
 import secrets
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, Query
-from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List
 from enum import Enum
-from pydantic import BaseModel, Field
+
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, Query, Body
+from sqlalchemy.orm import Session
 
 from database import SessionLocal, engine
 import models
@@ -15,7 +15,11 @@ from schemas import (
     TradeSignalOut,
     TradeRecordCreate,
     TradeRecordOut,
-    LatestSignalOut
+    LatestSignalOut,
+    AdminIssueTokenRequest,
+    AdminIssueTokenResponse,
+    ValidateRequest,
+    ValidateResponse,
 )
 
 models.Base.metadata.create_all(bind=engine)
@@ -37,6 +41,16 @@ def get_current_user(api_key: str = Query(None), db: Session = Depends(get_db)):
     user = crud.get_user_by_api_key(db, api_key)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid API Key")
+
+    # Only apply expiry/active checks for non-farm users here if you want
+    # For compatibility with existing callers to /signals/... that pass api_key:
+    if user.username != "farm_robot":
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="Account inactive")
+        now = datetime.now(timezone.utc)
+        if user.expires_at and user.expires_at <= now:
+            raise HTTPException(status_code=401, detail="Token expired")
+
     return user
 
 def require_admin(x_admin_key: str = Header(...)):
@@ -44,36 +58,48 @@ def require_admin(x_admin_key: str = Header(...)):
         raise HTTPException(status_code=403, detail="Forbidden")
     return True
 
-# ---------------- User Create Endpoint ----------------
-class Tier(str, Enum):
-    free = "free"
-    silver = "silver"
-    gold = "gold"
-
-class UserCreateRequest(BaseModel):
-    username: str = Field(..., min_length=3, max_length=32)
-    tier: Tier = Tier.free
-    quota: int = 1
-
-@app.post("/users")
-def create_user(
-    req: UserCreateRequest,
+# ---------------- Admin: Issue/Renew Token ----------------
+@app.post("/admin/tokens/issue", response_model=AdminIssueTokenResponse)
+def admin_issue_token(
+    req: AdminIssueTokenRequest,
     db: Session = Depends(get_db),
     admin_ok: bool = Depends(require_admin)
 ):
-    if db.query(models.User).filter_by(username=req.username).first():
-        raise HTTPException(status_code=400, detail="Username exists")
-    api_key = secrets.token_hex(16)
-    user = models.User(username=req.username, api_key=api_key, tier=req.tier, quota=req.quota)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return {
-        "username": user.username,
-        "api_key": user.api_key,
-        "tier": user.tier,
-        "quota": user.quota
-    }
+    user = crud.issue_or_rotate_token(
+        db,
+        email=req.email,
+        username=req.username,
+        plan=req.plan.lower(),
+        daily_quota_override=req.daily_quota,
+        months_valid=req.months_valid
+    )
+    return AdminIssueTokenResponse(
+        email=user.email,
+        username=user.username,
+        plan=user.plan,
+        api_key=user.api_key,
+        daily_quota=user.daily_quota,
+        expires_at=user.expires_at
+    )
+
+# ---------------- EA Validate (and consume quota) ----------------
+@app.post("/auth/validate", response_model=ValidateResponse)
+def validate(req: ValidateRequest, db: Session = Depends(get_db)):
+    ok, user, reason = crud.validate_and_consume(db, email=req.email, api_key=req.api_key)
+    if not ok:
+        raise HTTPException(status_code=401, detail=reason or "Unauthorized")
+
+    # remaining calc (None => unlimited)
+    remaining = None
+    if user.daily_quota is not None:
+        remaining = max(0, int(user.daily_quota) - int(user.used_today))
+
+    return ValidateResponse(
+        ok=True,
+        plan=user.plan or "free",
+        remaining_today=remaining,
+        expires_at=user.expires_at
+    )
 
 # ---------------- Signal Endpoints ----------------
 @app.post("/signals", response_model=TradeSignalOut)
@@ -87,10 +113,19 @@ def post_signal(signal: TradeSignalCreate, db: Session = Depends(get_db), user=D
 
 @app.get("/signals", response_model=List[LatestSignalOut])
 def get_all_latest_signals(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    # consume quota here for non-farm users
+    if user.username != "farm_robot":
+        ok, _, reason = crud.validate_and_consume(db, email=user.email or user.username, api_key=user.api_key)
+        if not ok:
+            raise HTTPException(status_code=429, detail=reason or "Rate limited")
     return db.query(models.LatestSignal).order_by(models.LatestSignal.symbol.asc()).all()
 
 @app.get("/signals/{symbol}", response_model=TradeSignalOut)
 def get_signal(symbol: str, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    if user.username != "farm_robot":
+        ok, _, reason = crud.validate_and_consume(db, email=user.email or user.username, api_key=user.api_key)
+        if not ok:
+            raise HTTPException(status_code=429, detail=reason or "Rate limited")
     latest_signal = crud.get_latest_signal(db, symbol)
     if not latest_signal:
         raise HTTPException(status_code=404, detail="No signal for this symbol")
@@ -115,3 +150,15 @@ async def debug_headers(request: Request):
 @app.get("/debug_cookies")
 async def debug_cookies(request: Request):
     return dict(request.cookies)
+
+@app.get("/me")
+def me(user=Depends(get_current_user)):
+    return {
+        "username": user.username,
+        "email": user.email,
+        "plan": user.plan,
+        "daily_quota": user.daily_quota,
+        "used_today": user.used_today,
+        "expires_at": user.expires_at,
+        "is_active": user.is_active
+    }

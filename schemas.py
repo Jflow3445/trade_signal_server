@@ -1,7 +1,8 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from typing import Optional, Dict, Any, Union
 from datetime import datetime
 
+# ===== Signals =====
 class TradeSignalBase(BaseModel):
     symbol: str
     action: str
@@ -20,7 +21,6 @@ class TradeSignalOut(TradeSignalBase):
     class Config:
         orm_mode = True
 
-# --- For upserting latest signal ---
 class LatestSignalOut(TradeSignalBase):
     id: int
     updated_at: datetime
@@ -28,7 +28,7 @@ class LatestSignalOut(TradeSignalBase):
     class Config:
         orm_mode = True
 
-# --- For trade record ---
+# ===== Trades =====
 class TradeRecordBase(BaseModel):
     symbol: str
     side: str
@@ -49,3 +49,31 @@ class TradeRecordOut(TradeRecordBase):
     user_id: Optional[int]
     class Config:
         orm_mode = True
+
+# ===== Admin token issue/renew =====
+class AdminIssueTokenRequest(BaseModel):
+    email: EmailStr
+    username: str
+    plan: str  # free|silver|gold
+    # optional overrides
+    daily_quota: Optional[int] = None
+    months_valid: Optional[int] = 1  # free can be None => no expiry
+
+class AdminIssueTokenResponse(BaseModel):
+    email: EmailStr
+    username: str
+    plan: str
+    api_key: str
+    daily_quota: Optional[int]
+    expires_at: Optional[datetime]
+
+# ===== EA validate =====
+class ValidateRequest(BaseModel):
+    email: EmailStr
+    api_key: str
+
+class ValidateResponse(BaseModel):
+    ok: bool
+    plan: str
+    remaining_today: Optional[int]  # None => unlimited
+    expires_at: Optional[datetime]
