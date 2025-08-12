@@ -1,167 +1,161 @@
 import os
-import uuid
+import hmac
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import List, Set, Dict, Any, Optional
+from collections.abc import Generator  # <-- for get_db type
 
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, Query, Response
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, Response, Query
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy.orm import Session
 
-from database import SessionLocal, engine
+from database import SessionLocal, engine, Base
 import models
 import crud
 from schemas import (
-    # signals
-    TradeSignalCreate,
-    TradeSignalOut,
-    LatestSignalOut,
-    # trades
-    TradeRecordCreate,
-    TradeRecordOut,
-    # admin token
-    AdminIssueTokenRequest,
-    AdminIssueTokenResponse,
-    # validate
-    ValidateRequest,
-    ValidateResponse,
-    # open positions sync (EA)
-    EAOpenPosition,
-    EASyncRequest,
-    EASyncResponse,
-    # admin activations view (optional)
+    TradeSignalCreate, TradeSignalOut, LatestSignalOut,
+    TradeRecordCreate, TradeRecordOut,
+    AdminIssueTokenRequest, AdminIssueTokenResponse,
+    ValidateRequest, ValidateResponse,
+    EASyncRequest, EASyncResponse,
     ActivationsList,
-    ActivationOut,
 )
 
 # ---------------- App / DB init ----------------
-models.Base.metadata.create_all(bind=engine)
-app = FastAPI()
+Base.metadata.create_all(bind=engine)  # Use Alembic for real migrations in prod
+app = FastAPI(title="Nister Trade Server", version="2.0.1")
 
 # ---------------- Logging ----------------
 logger = logging.getLogger("trade_server")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    fmt = logging.Formatter("[%(asctime)s] %(levelname)s in %(module)s: %(message)s")
-    handler.setFormatter(fmt)
-    logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(h)
 
-# ---------------- DB dependency ----------------
-def get_db():
+# ---------------- Middleware ----------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[],   # deny by default
+    allow_methods=[],
+    allow_headers=[],
+    allow_credentials=False,
+)
+
+class SecurityHeaders(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        resp: Response = await call_next(request)
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["X-Frame-Options"] = "DENY"
+        resp.headers["Referrer-Policy"] = "no-referrer"
+        resp.headers["Permissions-Policy"] = "geolocation=()"
+        return resp
+app.add_middleware(SecurityHeaders)
+
+# ---------------- DI: DB session ----------------
+def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-# ---------------- Config ----------------
-ADMIN_KEY_ENV = "TRADE_SERVER_API_KEY"
-DEFAULT_ADMIN_KEY = "b0e216c8d199091f36aaada01a056211"  # override in env
-ACTIONABLE: Set[str] = {"buy", "sell"}
-
-# In-memory cache of EA open positions per user (for maintenance signals past quota)
-OPEN_POS_CACHE: Dict[int, Dict[str, Any]] = {}
-OPEN_POS_TTL_SECONDS = int(os.getenv("OPEN_POS_TTL_SECONDS", "300"))  # 5 minutes default
-
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def set_open_positions(user_id: int, symbols: Set[str], raw_positions: List[Dict[str, Any]]) -> None:
-    OPEN_POS_CACHE[user_id] = {
-        "ts": _now_utc(),
-        "symbols": {s.upper() for s in symbols if s},
-        "raw": raw_positions,
-    }
-    logger.debug("set_open_positions user=%s symbols=%s", user_id, sorted(OPEN_POS_CACHE[user_id]["symbols"]))
-
-
-def get_open_symbols(user_id: int) -> Set[str]:
-    item = OPEN_POS_CACHE.get(user_id)
-    if not item:
-        return set()
-    ts: datetime = item.get("ts")  # type: ignore
-    if not ts or (_now_utc() - ts) > timedelta(seconds=OPEN_POS_TTL_SECONDS):
-        # stale; drop
-        OPEN_POS_CACHE.pop(user_id, None)
-        return set()
-    return set(item.get("symbols", set()))  # type: ignore
-
-
 # ---------------- Auth helpers ----------------
-def get_api_token(
-    authorization: Optional[str] = Header(None),
-    api_key: Optional[str] = Query(None),
-) -> str:
-    token: Optional[str] = None
+ADMIN_KEY_ENV = "ADMIN_KEY"
+ACTIONABLE: Set[str] = {
+    "buy","sell","adjust_sl","adjust_tp","close","close_all","hold","do_nothing"
+}
 
-    # Header first (Authorization: Bearer <token>)
+def get_api_token(authorization: Optional[str] = Header(None)) -> str:
+    token: Optional[str] = None
     if authorization:
         parts = authorization.split()
         if len(parts) == 2 and parts[0].lower() == "bearer":
             token = parts[1].strip()
-
-    # Fallback to query string
-    if not token and api_key:
-        token = api_key.strip()
-
-    # Strip <...> if someone pasted with angle brackets
-    if token and token.startswith("<") and token.endswith(">"):
-        token = token[1:-1].strip()
-
     if not token:
         raise HTTPException(status_code=401, detail="Missing API token")
     return token
 
-
-def get_current_user(token: str = Depends(get_api_token), db: Session = Depends(get_db)):
-    user = crud.get_user_by_api_key(db, token)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid API token")
-
-    # Non-farm users must be active and not expired
-    if user.username != "farm_robot":
-        if not user.is_active:
-            raise HTTPException(status_code=403, detail="Account inactive")
-        now = _now_utc()
-        if user.expires_at and user.expires_at <= now:
-            raise HTTPException(status_code=401, detail="Token expired")
-
-    return user
-
-
-def require_admin(x_admin_key: str = Header(...)):
-    want = os.getenv(ADMIN_KEY_ENV, DEFAULT_ADMIN_KEY)
-    if x_admin_key != want:
+def require_admin(x_admin_key: str = Header(...)) -> None:
+    want = os.getenv(ADMIN_KEY_ENV)
+    if not want:
+        raise HTTPException(status_code=500, detail="admin_key_not_configured")
+    if not hmac.compare_digest(x_admin_key, want):
         raise HTTPException(status_code=403, detail="Forbidden")
-    return True
 
+# ---------------- User context helpers ----------------
+def _effective_plan_and_quota(db: Session, user: models.User) -> Dict[str, Any]:
+    forced_free = (not user.is_active) or (user.expires_at and datetime.now(timezone.utc) >= user.expires_at)
+    base_plan = ("free" if forced_free else (user.plan or "free")).lower()
+    boost = crud.get_active_referral_boost(db, user.id)
+    if boost:
+        if base_plan == "free":
+            eff_plan = "silver"
+        elif base_plan == "silver":
+            eff_plan = "gold"
+        else:
+            eff_plan = "gold"
+    else:
+        eff_plan = base_plan
 
-# Parse activation headers from EA
-def read_activation_headers(
-    account_id: Optional[str] = Header(None, alias="X-Account-Id"),
-    broker_server: Optional[str] = Header(None, alias="X-Broker-Server"),
-    hwid: Optional[str] = Header(None, alias="X-Hwid"),
-):
-    return account_id, broker_server, hwid
+    if user.daily_quota is not None:
+        quota = user.daily_quota
+    else:
+        quota = crud.plan_defaults(eff_plan).get("daily_quota")
 
+    return {"plan": eff_plan, "daily_quota": quota, "expires_at": user.expires_at, "is_active": user.is_active}
 
-# ---------------- Admin: Issue/Renew Token ----------------
-@app.post("/admin/tokens/issue", response_model=AdminIssueTokenResponse)
-def admin_issue_token(
-    req: AdminIssueTokenRequest,
-    db: Session = Depends(get_db),
-    admin_ok: bool = Depends(require_admin),
-):
+# ---------------- Routes ----------------
+@app.get("/healthz")
+def healthz() -> Dict[str, str]:
+    return {"ok": "true"}
+
+# ---- Signals ----
+@app.post("/signals", response_model=TradeSignalOut)
+def post_signal(payload: TradeSignalCreate, token: str = Depends(get_api_token), db: Session = Depends(get_db)):
+    user = crud.user_by_token(db, token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if payload.action not in ACTIONABLE:
+        raise HTTPException(status_code=400, detail="Unsupported action")
+    sig = crud.create_signal(db, user_id=user.id, s=payload)
+    return sig
+
+@app.get("/signals", response_model=List[TradeSignalOut])
+def get_signals(limit: int = Query(100, ge=1, le=1000), token: str = Depends(get_api_token), db: Session = Depends(get_db)):
+    user = crud.user_by_token(db, token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    rows = crud.list_signals(db, user.id, limit=limit)
+    return rows
+
+@app.get("/signals/latest", response_model=List[LatestSignalOut])
+def get_latest(limit: int = Query(50, ge=1, le=200), token: str = Depends(get_api_token), db: Session = Depends(get_db)):
+    user = crud.user_by_token(db, token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    rows = crud.list_latest_signals(db, user.id, limit=limit)
+    return rows
+
+# ---- Trades ----
+@app.post("/trades", response_model=TradeRecordOut)
+def post_trade(payload: TradeRecordCreate, token: str = Depends(get_api_token), db: Session = Depends(get_db)):
+    user = crud.user_by_token(db, token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    row = crud.create_trade_record(db, payload, user_id=user.id)
+    return row
+
+# ---- Admin: issue/rotate token ----
+@app.post("/admin/issue_token", response_model=AdminIssueTokenResponse, dependencies=[Depends(require_admin)])
+def admin_issue_token(req: AdminIssueTokenRequest, db: Session = Depends(get_db)):
     try:
-        user = crud.issue_or_rotate_token(
+        user = crud.issue_or_update_user(
             db,
-            email=req.email,
-            username=req.username,
-            plan=req.plan.lower(),
+            email=req.email, username=req.username, plan=req.plan,
             daily_quota_override=req.daily_quota,
-            months_valid=(req.months_valid if req.months_valid is not None else getattr(req, "months", None)),
+            months_valid=req.months_valid,
         )
         return AdminIssueTokenResponse(
             email=user.email,
@@ -173,289 +167,43 @@ def admin_issue_token(
             expires_at=user.expires_at,
             is_active=user.is_active,
         )
-    except Exception as e:
-        err_id = str(uuid.uuid4())[:8]
-        logger.exception("admin_issue_token error [%s]", err_id)
-        raise HTTPException(status_code=500, detail=f"server_error:{err_id}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-
-# (Optional) Admin view activations for a user
-@app.get("/admin/activations", response_model=ActivationsList)
-def admin_activations(
-    email: str,
-    db: Session = Depends(get_db),
-    admin_ok: bool = Depends(require_admin),
-):
-    try:
-        user = crud.get_user_by_email(db, email)
-        if not user:
-            raise HTTPException(status_code=404, detail="No such user")
-        items = crud.list_activations(db, user.id)
-        return ActivationsList(
-            email=email,
-            plan=user.plan or "free",
-            used=len(items),
-            limit=crud.plan_activation_limit(user.plan),
-            items=[ActivationOut.from_orm(a) for a in items],
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        err_id = str(uuid.uuid4())[:8]
-        logger.exception("admin_activations error [%s]", err_id)
-        raise HTTPException(status_code=500, detail=f"server_error:{err_id}")
-
-
-# ---------------- EA Validate (does not consume quota) ----------------
-@app.post("/auth/validate", response_model=ValidateResponse)
+# ---- Validate (EA) ----
+@app.post("/validate", response_model=ValidateResponse)
 def validate(req: ValidateRequest, db: Session = Depends(get_db)):
-    try:
-        user = crud.get_user_by_email(db, req.email)
-        if not user or user.api_key != req.api_key:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
+    user = crud.user_by_email(db, req.email)
+    if not user or not hmac.compare_digest(user.api_key, req.api_key):
+        return ValidateResponse(ok=False)
+    eff = _effective_plan_and_quota(db, user)
+    return ValidateResponse(ok=True, plan=eff["plan"], daily_quota=eff["daily_quota"],
+                            expires_at=eff["expires_at"], is_active=eff["is_active"])
 
-        if user.username != "farm_robot":
-            if not user.is_active:
-                raise HTTPException(status_code=403, detail="Account inactive")
-            now = _now_utc()
-            if user.expires_at and user.expires_at <= now:
-                raise HTTPException(status_code=401, detail="Token expired")
+# ---- EA: sync open positions ----
+@app.post("/ea/sync_open_positions", response_model=EASyncResponse)
+def ea_sync_positions(payload: EASyncRequest, token: str = Depends(get_api_token), db: Session = Depends(get_db)):
+    user = crud.user_by_token(db, token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    crud.touch_activation(db, user_id=user.id, account_id=payload.account_id,
+                          broker_server=payload.broker_server, hwid=None)
+    upserted = crud.upsert_open_positions(
+        db, user_id=user.id, account_id=payload.account_id, broker_server=payload.broker_server,
+        positions=payload.positions
+    )
+    return EASyncResponse(ok=True, upserted=upserted)
 
-        remaining = crud.get_remaining_today(user)
-        return ValidateResponse(
-            ok=True,
-            plan=user.plan or "free",
-            daily_quota=user.daily_quota,
-            remaining_today=remaining if remaining is not None else None,
-            expires_at=user.expires_at,
-            is_active=user.is_active,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        err_id = str(uuid.uuid4())[:8]
-        logger.exception("validate error [%s]", err_id)
-        raise HTTPException(status_code=500, detail=f"server_error:{err_id}")
-
-
-# ---------------- EA Open Positions Sync (for maintenance past quota) ----------------
-@app.post("/client/open_positions", response_model=EASyncResponse)
-def sync_open_positions(
-    payload: EASyncRequest,
-    user=Depends(get_current_user),
-):
-    try:
-        positions = payload.positions or []
-        syms = {(p.symbol or "").upper().strip() for p in positions if (p.symbol or "").strip()}
-        set_open_positions(user.id, syms, [p.dict() for p in positions])
-        return EASyncResponse(received=len(positions), upserted=len(syms), pruned=0)
-    except Exception:
-        err_id = str(uuid.uuid4())[:8]
-        logger.exception("open_positions error [%s] user=%s", err_id, getattr(user, "id", "?"))
-        raise HTTPException(status_code=400, detail=f"bad_open_positions:{err_id}")
-
-
-# ---------------- Signal Endpoints ----------------
-@app.post("/signals", response_model=TradeSignalOut)
-def post_signal(signal: TradeSignalCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    try:
-        if user.username != "farm_robot":
-            raise HTTPException(status_code=403, detail="Not authorized to POST signals")
-        signal.user_id = user.id
-        created_signal = crud.create_signal(db, signal)
-        crud.upsert_latest_signal(db, signal)
-        return created_signal
-    except HTTPException:
-        raise
-    except Exception:
-        err_id = str(uuid.uuid4())[:8]
-        logger.exception("post_signal error [%s] user=%s", err_id, getattr(user, "id", "?"))
-        raise HTTPException(status_code=500, detail=f"server_error:{err_id}")
-
-
-@app.get("/signals", response_model=List[LatestSignalOut])
-def get_all_latest_signals(
-    response: Response,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user),
-    act_hdrs=Depends(read_activation_headers),
-):
-    try:
-        # Activation enforcement for non-farm users
-        if user.username != "farm_robot":
-            account_id, broker_server, hwid = act_hdrs
-            if not account_id or not broker_server:
-                raise HTTPException(status_code=400, detail="Missing activation headers")
-            ok, used, limit = crud.ensure_activation(db, user, str(account_id), str(broker_server), str(hwid) if hwid else None)
-            if not ok:
-                raise HTTPException(status_code=403, detail="activation_limit")
-
-        # Fetch latest signals
-        all_signals = db.query(models.LatestSignal).order_by(models.LatestSignal.symbol.asc()).all()
-        actionable = [s for s in all_signals if (s.action or "").lower() in ACTIONABLE]
-        maintenance = [s for s in all_signals if (s.action or "").lower() not in ACTIONABLE]
-
-        actionable_count = len(actionable)
-        remaining = crud.get_remaining_today(user)  # None means unlimited
-
-        # Determine delivery and consumption
-        deliver_actionable: List[models.LatestSignal] = actionable
-        to_consume = actionable_count
-
-        # Past-quota maintenance should only be sent for symbols the user currently has open
-        tracked_syms = get_open_symbols(user.id) if user.username != "farm_robot" else set()
-
-        if user.username != "farm_robot":
-            if remaining is not None:
-                if remaining <= 0:
-                    deliver_actionable = []
-                    to_consume = 0
-                elif remaining < actionable_count:
-                    deliver_actionable = actionable[:remaining]
-                    to_consume = remaining
-
-        # Maintenance payload:
-        if user.username != "farm_robot" and remaining is not None and remaining <= 0:
-            deliver_maintenance = [m for m in maintenance if (m.symbol or "").upper() in tracked_syms]
-        else:
-            deliver_maintenance = maintenance
-
-        # consume only actionable we return (non-farm)
-        if user.username != "farm_robot" and to_consume > 0:
-            if not crud.consume_n(db, user, to_consume):
-                # Safety: if concurrent request consumed it, drop actionable
-                deliver_actionable = []
-                if remaining is not None and remaining <= 0:
-                    deliver_maintenance = [m for m in maintenance if (m.symbol or "").upper() in tracked_syms]
-
-        out = deliver_actionable + deliver_maintenance
-
-        # headers
-        response.headers["X-Quota-Daily"] = str(user.daily_quota) if user.daily_quota is not None else "unlimited"
-        rem_after = crud.get_remaining_today(user)
-        response.headers["X-Quota-Remaining"] = str(rem_after) if rem_after is not None else "unlimited"
-        response.headers["X-Actionable-Returned"] = str(len(deliver_actionable))
-        if user.username != "farm_robot":
-            response.headers["X-Activations-Used"] = str(crud.count_activations(db, user.id))
-            lim = crud.plan_activation_limit(user.plan)
-            response.headers["X-Activations-Limit"] = str(lim) if lim is not None else "unlimited"
-            if tracked_syms:
-                response.headers["X-OpenSymbols-Tracked"] = ",".join(sorted(tracked_syms))
-
-        return out
-    except HTTPException:
-        raise
-    except Exception:
-        err_id = str(uuid.uuid4())[:8]
-        logger.exception("get_all_latest_signals error [%s] user=%s", err_id, getattr(user, "id", "?"))
-        raise HTTPException(status_code=500, detail=f"server_error:{err_id}")
-
-
-@app.get("/signals/{symbol}", response_model=TradeSignalOut)
-def get_signal(
-    symbol: str,
-    response: Response,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user),
-    act_hdrs=Depends(read_activation_headers),
-):
-    try:
-        if user.username != "farm_robot":
-            account_id, broker_server, hwid = act_hdrs
-            if not account_id or not broker_server:
-                raise HTTPException(status_code=400, detail="Missing activation headers")
-            ok, used, limit = crud.ensure_activation(db, user, str(account_id), str(broker_server), str(hwid) if hwid else None)
-            if not ok:
-                raise HTTPException(status_code=403, detail="activation_limit")
-
-        latest_signal = crud.get_latest_signal(db, symbol)
-        if not latest_signal:
-            raise HTTPException(status_code=404, detail="No signal for this symbol")
-
-        act = (latest_signal.action or "").lower()
-        is_actionable = act in ACTIONABLE
-
-        if user.username != "farm_robot" and is_actionable:
-            remaining = crud.get_remaining_today(user)
-            if remaining is not None and remaining <= 0:
-                raise HTTPException(status_code=429, detail="quota_exhausted")
-            if not crud.consume_n(db, user, 1):
-                raise HTTPException(status_code=429, detail="quota_exhausted")
-
-        # Maintenance allowed past quota only for tracked symbols
-        if user.username != "farm_robot" and not is_actionable:
-            remaining = crud.get_remaining_today(user)
-            if remaining is not None and remaining <= 0:
-                tracked_syms = get_open_symbols(user.id)
-                if (symbol or "").upper() not in tracked_syms:
-                    raise HTTPException(status_code=429, detail="quota_exhausted")
-
-        # headers
-        response.headers["X-Quota-Daily"] = str(user.daily_quota) if user.daily_quota is not None else "unlimited"
-        rem_after = crud.get_remaining_today(user)
-        response.headers["X-Quota-Remaining"] = str(rem_after) if rem_after is not None else "unlimited"
-        response.headers["X-Actionable-Returned"] = "1" if is_actionable else "0"
-        if user.username != "farm_robot":
-            response.headers["X-Activations-Used"] = str(crud.count_activations(db, user.id))
-            lim = crud.plan_activation_limit(user.plan)
-            response.headers["X-Activations-Limit"] = str(lim) if lim is not None else "unlimited"
-
-        return latest_signal
-    except HTTPException:
-        raise
-    except Exception:
-        err_id = str(uuid.uuid4())[:8]
-        logger.exception("get_signal error [%s] user=%s symbol=%s", err_id, getattr(user, "id", "?"), symbol)
-        raise HTTPException(status_code=500, detail=f"server_error:{err_id}")
-
-
-# ---------------- Trade Endpoints ----------------
-@app.post("/trades", response_model=TradeRecordOut)
-def post_trade(trade: TradeRecordCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    try:
-        trade.user_id = user.id
-        trade.timestamp = datetime.utcnow()
-        return crud.create_trade_record(db, trade)
-    except Exception:
-        err_id = str(uuid.uuid4())[:8]
-        logger.exception("post_trade error [%s] user=%s", err_id, getattr(user, "id", "?"))
-        raise HTTPException(status_code=500, detail=f"server_error:{err_id}")
-
-
-@app.get("/trades", response_model=List[TradeRecordOut])
-def get_all_trades(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    try:
-        return db.query(models.TradeRecord).order_by(models.TradeRecord.id.desc()).all()
-    except Exception:
-        err_id = str(uuid.uuid4())[:8]
-        logger.exception("get_all_trades error [%s] user=%s", err_id, getattr(user, "id", "?"))
-        raise HTTPException(status_code=500, detail=f"server_error:{err_id}")
-
-
-# ---------------- Debug / Utility ----------------
-@app.get("/debug_headers")
-async def debug_headers(request: Request):
-    return dict(request.headers)
-
-
-@app.get("/debug_cookies")
-async def debug_cookies(request: Request):
-    return dict(request.cookies)
-
-
-@app.get("/me")
-def me(user=Depends(get_current_user)):
-    return {
-        "username": user.username,
-        "email": user.email,
-        "plan": user.plan,
-        "daily_quota": user.daily_quota,
-        "used_today": user.used_today,
-        "expires_at": user.expires_at,
-        "is_active": user.is_active,
-    }
-
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
+# ---- Optional: admin view activations for a user ----
+@app.get("/admin/activations/{username}", response_model=ActivationsList, dependencies=[Depends(require_admin)])
+def admin_list_activations(username: str, db: Session = Depends(get_db)):
+    u = db.query(models.User).filter(models.User.username == username.lower()).one_or_none()
+    if not u:
+        raise HTTPException(status_code=404, detail="user_not_found")
+    items = db.query(models.Activation).filter(models.Activation.user_id == u.id)\
+            .order_by(models.Activation.last_seen_at.desc()).all()
+    return ActivationsList(
+        email=u.email, plan=u.plan,
+        used=len(items), limit=None,
+        items=items
+    )

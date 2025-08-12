@@ -1,331 +1,208 @@
-from datetime import datetime, timedelta, timezone
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-from models import TradeSignal, User, LatestSignal, TradeRecord, Activation
-from schemas import TradeSignalCreate, TradeRecordCreate
+from __future__ import annotations
 import secrets
-from schemas import EAOpenPosition
-import json
-import models
-from sqlalchemy import and_
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Iterable, List, Dict, Any
+
+from sqlalchemy.orm import Session
+from models import (
+    User, TradeSignal, LatestSignal, TradeRecord, Activation,
+    OpenPosition, ReferralBoost
+)
+from schemas import TradeSignalCreate, TradeRecordCreate, EAOpenPosition
+
 UTC = timezone.utc
 
-# ---------- Plan rules ----------
+# ---------- Plans & quotas ----------
+PLAN_DEFAULTS = {
+    "free":   {"daily_quota": 1},
+    "silver": {"daily_quota": 3},
+    "gold":   {"daily_quota": None},  # unlimited
+}
+
 def plan_defaults(plan: str) -> dict:
-    p = (plan or "free").lower()
-    if p == "gold":
-        return {"daily_quota": None, "months_valid": 1}
-    if p == "silver":
-        return {"daily_quota": 3, "months_valid": 1}
-    # free
-    return {"daily_quota": 1, "months_valid": None}
+    return PLAN_DEFAULTS.get((plan or "free").lower(), PLAN_DEFAULTS["free"]).copy()
 
-def upsert_open_position(db: Session, user_id: int, account_id: str, broker_server: str, hwid: str | None, p: EAOpenPosition) -> bool:
-    """Insert or update a single open position. Returns True if inserted/updated."""
-    row = db.query(models.OpenPosition).filter(
-        and_(
-            models.OpenPosition.user_id == user_id,
-            models.OpenPosition.account_id == account_id,
-            models.OpenPosition.broker_server == broker_server,
-            models.OpenPosition.ticket == p.ticket,
-        )
-    ).one_or_none()
+def now() -> datetime:
+    return datetime.now(tz=UTC)
 
-    changed = False
-    if row is None:
-        row = models.OpenPosition(
-            user_id=user_id,
-            account_id=account_id,
-            broker_server=broker_server,
-            hwid=hwid,
-            ticket=p.ticket,
-            symbol=p.symbol.upper(),
-            side=p.side.lower(),
-            volume=p.volume,
-            entry_price=p.entry_price,
-            sl=p.sl,
-            tp=p.tp,
-            open_time=p.open_time,
-            magic=p.magic,
-            comment=p.comment,
-            updated_at=datetime.utcnow(),
-        )
-        db.add(row)
-        changed = True
-    else:
-        # update fields if changed
-        def upd(attr, val):
-            nonlocal changed
-            if getattr(row, attr) != val:
-                setattr(row, attr, val)
-                changed = True
-
-        upd("hwid", hwid)
-        upd("symbol", p.symbol.upper())
-        upd("side", p.side.lower())
-        upd("volume", p.volume)
-        upd("entry_price", p.entry_price)
-        upd("sl", p.sl)
-        upd("tp", p.tp)
-        upd("open_time", p.open_time)
-        upd("magic", p.magic)
-        upd("comment", p.comment)
-        row.updated_at = datetime.utcnow()
-
-    if changed:
-        db.commit()
-    return changed
-
-def prune_open_positions(db: Session, user_id: int, account_id: str, broker_server: str, keep_tickets: set[str]) -> int:
-    """Delete any open positions not in keep_tickets for this user/account/server."""
-    q = db.query(models.OpenPosition).filter(
-        and_(
-            models.OpenPosition.user_id == user_id,
-            models.OpenPosition.account_id == account_id,
-            models.OpenPosition.broker_server == broker_server
-        )
-    )
-    removed = 0
-    for row in q.all():
-        if row.ticket not in keep_tickets:
-            db.delete(row)
-            removed += 1
-    if removed:
-        db.commit()
-    return removed
-
-def get_open_symbols(db: Session, user_id: int, account_id: str, broker_server: str) -> set[str]:
-    rows = db.query(models.OpenPosition.symbol).filter(
-        and_(
-            models.OpenPosition.user_id == user_id,
-            models.OpenPosition.account_id == account_id,
-            models.OpenPosition.broker_server == broker_server
-        )
-    ).all()
-    return { (r[0] or "").upper() for r in rows }
-
-def ensure_user(db: Session, email: str, username: str | None, plan: str, daily_quota_override: int | None) -> User:
-    u = get_user_by_email(db, email)
-    defaults = plan_defaults(plan)
-    dq = daily_quota_override if daily_quota_override is not None else defaults["daily_quota"]
-    if not u:
-        u = User(
-            email=email,
-            username=(username or email.split("@")[0]),
-            plan=plan,
-            tier=plan,
-            daily_quota=dq,
-            quota=dq,  # keep legacy column in sync
-            is_active=True,
-            used_today=0,
-            usage_reset_at=datetime.now(UTC),
-            expires_at=(None if defaults["months_valid"] is None else datetime.now(UTC) + timedelta(days=30 * defaults["months_valid"]))
-        )
-        db.add(u)
-        db.commit()
-        db.refresh(u)
-    else:
-        u.plan = plan
-        u.tier = plan
-        u.daily_quota = dq
-        u.quota = dq
-        # don't change expires_at here; rotation path below sets it explicitly
-        db.commit()
-        db.refresh(u)
-    return u
-def plan_activation_limit(plan: str):
-    p = (plan or "free").lower()
-    if p == "gold":   return 3
-    if p == "silver": return 1
-    return 1  # free
-
-# ---------- Users ----------
-def get_user_by_api_key(db: Session, api_key: str):
-    return db.query(User).filter(User.api_key == api_key).first()
-
-def get_user_by_email(db: Session, email: str):
-    return db.query(User).filter(User.email == email).first()
-
-def ensure_daily_reset(user: User) -> None:
-    now = datetime.now(UTC)
-    if not user.usage_reset_at or user.usage_reset_at.date() != now.date():
-        user.used_today = 0
-        user.usage_reset_at = now
-
-def get_remaining_today(user: User):
-    if user.username == "farm_robot":
+def to_datetime(dt) -> Optional[datetime]:
+    if dt is None:
         return None
-    ensure_daily_reset(user)
-    if user.daily_quota is None:
-        return None
-    return max(0, int(user.daily_quota) - int(user.used_today))
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+    raise TypeError("Expected datetime or None")
 
-def consume_n(db: Session, user: User, n: int) -> bool:
-    if n <= 0:
-        return True
-    if user.username == "farm_robot":
-        return True
-    ensure_daily_reset(user)
-    if user.daily_quota is None:
-        return True
-    if user.used_today + n > user.daily_quota:
-        return False
-    user.used_today += n
-    db.commit()
-    db.refresh(user)
-    return True
-
-def clear_activations_for_user(db: Session, user_id: int):
-    db.query(Activation).filter(Activation.user_id == user_id).delete(synchronize_session=False)
-    db.commit()
-
-def issue_or_rotate_token(
+# ---------- Users / tokens ----------
+def issue_or_update_user(
     db: Session,
-    *,
-    email: str,
-    username: str,
-    plan: str,
-    daily_quota_override: int | None = None,
-    months_valid: int | None = 1
+    *, email: Optional[str], username: str, plan: str,
+    daily_quota_override: Optional[int] = None,
+    months_valid: Optional[int] = None,
 ) -> User:
-    user = get_user_by_email(db, email)
-    defaults = plan_defaults(plan)
-    dq = daily_quota_override if daily_quota_override is not None else defaults["daily_quota"]
-    # Decide final months_valid: if caller passes None, use default
-    mv = defaults["months_valid"] if months_valid is None else months_valid
-    expires = None if (plan.lower() == "free" or mv is None) else datetime.now(UTC) + timedelta(days=30 * mv)
+    username = username.strip().lower()
+    if username in {"farm_robot"}:
+        # Disallow reserved names
+        raise ValueError("reserved_username")
 
-    if not user:
+    token = secrets.token_hex(32)
+    user = db.query(User).filter(User.username == username).one_or_none()
+    if user:
+        user.email = email or user.email
+        user.plan = plan
+        user.api_key = token
+        user.daily_quota = daily_quota_override
+        if months_valid:
+            user.expires_at = now() + timedelta(days=30*months_valid)
+        user.is_active = True
+    else:
         user = User(
             email=email,
-            username=username or email.split("@")[0],
-            api_key=secrets.token_hex(16),
+            username=username,
+            api_key=token,
             plan=plan,
-            daily_quota=dq,
-            used_today=0,
-            usage_reset_at=datetime.now(UTC),
-            expires_at=expires,
-            is_active=True
+            daily_quota=daily_quota_override,
+            expires_at=(now() + timedelta(days=30*months_valid)) if months_valid else None,
+            is_active=True,
         )
         db.add(user)
-        db.commit()
-        db.refresh(user)
-        return user
-
-    # rotate token and update
-    user.api_key = secrets.token_hex(16)
-    user.plan = plan
-    user.daily_quota = dq
-    user.used_today = 0
-    user.usage_reset_at = datetime.now(UTC)
-    user.expires_at = expires
-    user.is_active = True
     db.commit()
     db.refresh(user)
     return user
 
-# ---------- Activations ----------
-def count_activations(db: Session, user_id: int) -> int:
-    return db.query(func.count(Activation.id)).filter(Activation.user_id == user_id).scalar() or 0
+def user_by_token(db: Session, token: str) -> Optional[User]:
+    return db.query(User).filter(User.api_key == token, User.is_active == True).one_or_none()
 
-def find_activation(db: Session, user_id: int, account_id: str, broker_server: str):
-    return db.query(Activation).filter(
-        Activation.user_id == user_id,
-        Activation.account_id == account_id,
-        Activation.broker_server == broker_server
-    ).first()
+def user_by_email(db: Session, email: str) -> Optional[User]:
+    return db.query(User).filter(User.email == email).one_or_none()
 
-def ensure_activation(db, user, account_id: str, broker_server: str, hwid: str | None):
-    if user.username == "farm_robot":
-        return True, 0, None
-
-    limit = plan_activation_limit(user.plan)
-    used  = count_activations(db, user.id)
-
-    # Already at limit? bail early unless it already exists
-    existing = find_activation(db, user.id, account_id, broker_server)
-    if not existing and used >= (limit or 0):
-        return False, used, limit
-
-    stmt = (
-        pg_insert(Activation)
-        .values(
-            user_id=user.id,
-            account_id=account_id,
-            broker_server=broker_server,
-            hwid=hwid,
-            created_at=func.now(),
-            last_seen_at=func.now(),
-        )
-        .on_conflict_do_update(
-            index_elements=[Activation.user_id, Activation.account_id, Activation.broker_server],
-            set_={
-                "last_seen_at": func.now(),
-                "hwid": func.coalesce(Activation.hwid, hwid),
-            },
-        )
-    )
-    db.execute(stmt)
-    db.commit()
-    # If it already existed, 'used' didn’t increase
-    return True, (used if existing else used + 1), limit
-
-def list_activations(db: Session, user_id: int):
-    return db.query(Activation).filter(Activation.user_id == user_id).order_by(Activation.created_at.asc()).all()
+# ---------- Referral boost ----------
+def get_active_referral_boost(db: Session, user_id: int) -> Optional[ReferralBoost]:
+    """
+    Returns an active referral boost record if current time is within [start_at, end_at)
+    and not revoked. If multiple overlaps exist, return the one with the highest boost (gold > silver),
+    breaking ties by latest end_at.
+    """
+    now_ts = now()
+    boosts = (db.query(ReferralBoost)
+                .filter(
+                    ReferralBoost.user_id == user_id,
+                    ReferralBoost.is_revoked == False,
+                    ReferralBoost.start_at <= now_ts,
+                    ReferralBoost.end_at > now_ts,
+                )
+                .all())
+    if not boosts:
+        return None
+    def score(b: ReferralBoost):
+        level = 2 if b.boost_to == "gold" else 1
+        return (level, b.end_at)
+    boosts.sort(key=score, reverse=True)
+    return boosts[0]
 
 # ---------- Signals ----------
-def create_signal(db: Session, signal: TradeSignalCreate):
-    db_signal = TradeSignal(**signal.dict())
-    db.add(db_signal)
-    db.commit()
-    db.refresh(db_signal)
-    return db_signal
-
-def upsert_latest_signal(db: Session, signal: TradeSignalCreate):
-    from datetime import datetime as dt, timezone
-    db_signal = db.query(LatestSignal).filter(LatestSignal.symbol == signal.symbol).first()
-    if db_signal:
-        for field, value in signal.dict().items():
-            setattr(db_signal, field, value)
-        db_signal.updated_at = dt.now(timezone.utc)
+def create_signal(db: Session, user_id: int, s: TradeSignalCreate) -> TradeSignal:
+    sig = TradeSignal(
+        user_id=user_id,
+        symbol=s.symbol,
+        action=s.action,
+        sl_pips=s.sl_pips,
+        tp_pips=s.tp_pips,
+        lot_size=s.lot_size,
+        details=s.details,
+    )
+    db.add(sig)
+    # upsert latest
+    latest = (db.query(LatestSignal)
+                .filter(LatestSignal.user_id == user_id, LatestSignal.symbol == s.symbol)
+                .one_or_none())
+    if latest:
+        latest.action = s.action
+        latest.sl_pips = s.sl_pips
+        latest.tp_pips = s.tp_pips
+        latest.lot_size = s.lot_size
+        latest.details = s.details
     else:
-        db_signal = LatestSignal(**signal.dict())
-        db.add(db_signal)
+        latest = LatestSignal(
+            user_id=user_id, symbol=s.symbol, action=s.action,
+            sl_pips=s.sl_pips, tp_pips=s.tp_pips, lot_size=s.lot_size, details=s.details
+        )
+        db.add(latest)
     db.commit()
-    db.refresh(db_signal)
-    return db_signal
+    db.refresh(sig)
+    return sig
 
-def get_latest_signal(db: Session, symbol: str):
-    return db.query(LatestSignal).filter(LatestSignal.symbol == symbol).first()
+def list_signals(db: Session, user_id: int, limit: int = 100):
+    return (db.query(TradeSignal)
+              .filter(TradeSignal.user_id == user_id)
+              .order_by(TradeSignal.created_at.desc())
+              .limit(limit).all())
+
+def list_latest_signals(db: Session, user_id: int, limit: int = 50):
+    return (db.query(LatestSignal)
+              .filter(LatestSignal.user_id == user_id)
+              .order_by(LatestSignal.updated_at.desc())
+              .limit(limit).all())
 
 # ---------- Trades ----------
-def create_trade_record(db: Session, trade: TradeRecordCreate) -> TradeRecord:
-    from datetime import datetime as dt
-    def to_datetime(val):
-        if isinstance(val, (float, int)):
-            return dt.utcfromtimestamp(val)
-        if isinstance(val, str):
-            try:
-                return dt.fromisoformat(val)
-            except Exception:
-                return None
-        return val
-
-    db_trade = TradeRecord(
+def create_trade_record(db: Session, trade: TradeRecordCreate, user_id: int) -> TradeRecord:
+    tr = TradeRecord(
+        user_id=user_id,
         symbol=trade.symbol,
         side=trade.side,
         entry_price=trade.entry_price,
         exit_price=trade.exit_price,
         volume=trade.volume,
         pnl=trade.pnl,
-        duration=str(trade.duration) if trade.duration is not None else None,
-        open_time=to_datetime(trade.open_time) if trade.open_time else None,
-        close_time=to_datetime(trade.close_time) if trade.close_time else None,
+        duration=trade.duration,
+        open_time=to_datetime(trade.open_time),
+        close_time=to_datetime(trade.close_time),
         details=trade.details,
-        user_id=trade.user_id
     )
-    db.add(db_trade)
+    db.add(tr)
     db.commit()
-    db.refresh(db_trade)
-    return db_trade
+    db.refresh(tr)
+    return tr
+
+# ---------- EA activations / positions ----------
+def touch_activation(db: Session, user_id: int, account_id: str, broker_server: str, hwid: Optional[str]) -> Activation:
+    act = (db.query(Activation)
+             .filter(Activation.user_id == user_id,
+                     Activation.account_id == account_id,
+                     Activation.broker_server == broker_server)
+             .one_or_none())
+    if act:
+        act.last_seen_at = now()
+        if hwid:
+            act.hwid = hwid
+    else:
+        act = Activation(
+            user_id=user_id, account_id=account_id, broker_server=broker_server, hwid=hwid
+        )
+        db.add(act)
+    db.commit()
+    db.refresh(act)
+    return act
+
+def upsert_open_positions(
+    db: Session, user_id: int, account_id: str, broker_server: str, positions: Iterable[EAOpenPosition]
+) -> int:
+    # naive upsert: delete old for user/account/server then insert provided set
+    db.query(OpenPosition).filter(
+        OpenPosition.user_id == user_id,
+        OpenPosition.account_id == account_id,
+        OpenPosition.broker_server == broker_server,
+    ).delete(synchronize_session=False)
+
+    count = 0
+    for p in positions:
+        row = OpenPosition(
+            user_id=user_id, account_id=account_id, broker_server=broker_server, ticket=p.ticket,
+            symbol=p.symbol, side=p.side, volume=p.volume, entry_price=p.entry_price, sl=p.sl, tp=p.tp,
+            open_time=to_datetime(p.open_time), magic=p.magic, comment=p.comment
+        )
+        db.add(row)
+        count += 1
+    db.commit()
+    return count
