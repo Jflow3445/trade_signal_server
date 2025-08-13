@@ -68,9 +68,12 @@ ACTIONABLE: Set[str] = {
 def get_api_token(authorization: Optional[str] = Header(None)) -> str:
     token: Optional[str] = None
     if authorization:
-        parts = authorization.split()
+        parts = authorization.split(None, 1)
         if len(parts) == 2 and parts[0].lower() == "bearer":
-            token = parts[1].strip()
+            t = parts[1].strip().strip('"').strip("'")
+            if t.startswith("<") and t.endswith(">") and len(t) > 2:
+                t = t[1:-1]
+            token = t
     if not token:
         raise HTTPException(status_code=401, detail="Missing API token")
     return token
