@@ -4,12 +4,10 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Set, Dict, Any, Optional
 from collections.abc import Generator  # <-- for get_db type
-
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy.orm import Session
-
 from database import SessionLocal, engine, Base
 import models
 import crud
@@ -123,19 +121,70 @@ def post_signal(payload: TradeSignalCreate, token: str = Depends(get_api_token),
     return sig
 
 @app.get("/signals", response_model=List[TradeSignalOut])
-def get_signals(limit: int = Query(100, ge=1, le=1000), token: str = Depends(get_api_token), db: Session = Depends(get_db)):
+def get_signals(
+    limit: int = Query(100, ge=1, le=1000),
+    token: str = Depends(get_api_token),
+    db: Session = Depends(get_db),
+    resp: Response = None,
+):
     user = crud.user_by_token(db, token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
-    rows = crud.list_signals(db, user.id, limit=limit)
+
+    eff = _effective_plan_and_quota(db, user)
+    quota = eff["daily_quota"]  # None means unlimited
+    if quota is None:
+        rows = crud.list_signals(db, user.id, limit=limit)
+        if resp:
+            resp.headers["X-Quota-Limit"] = "unlimited"
+            resp.headers["X-Quota-Remaining"] = "unlimited"
+        return rows
+
+    used = crud.count_signals_created_today(db, user.id)
+    remaining = max(quota - used, 0)
+    if remaining == 0:
+        # hard stop once quota is consumed
+        raise HTTPException(status_code=429, detail="quota_exhausted")
+
+    # cap page size to remaining
+    eff_limit = min(limit, remaining)
+    rows = crud.list_signals(db, user.id, limit=eff_limit)
+    if resp:
+        resp.headers["X-Quota-Limit"] = str(quota)
+        resp.headers["X-Quota-Remaining"] = str(remaining - len(rows))
     return rows
 
 @app.get("/signals/latest", response_model=List[LatestSignalOut])
-def get_latest(limit: int = Query(50, ge=1, le=200), token: str = Depends(get_api_token), db: Session = Depends(get_db)):
+def get_latest(
+    limit: int = Query(50, ge=1, le=200),
+    token: str = Depends(get_api_token),
+    db: Session = Depends(get_db),
+    resp: Response = None,
+):
     user = crud.user_by_token(db, token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
-    rows = crud.list_latest_signals(db, user.id, limit=limit)
+
+    eff = _effective_plan_and_quota(db, user)
+    quota = eff["daily_quota"]
+    if quota is None:
+        rows = crud.list_latest_signals(db, user.id, limit=limit)
+        if resp:
+            resp.headers["X-Quota-Limit"] = "unlimited"
+            resp.headers["X-Quota-Remaining"] = "unlimited"
+        return rows
+
+    used = crud.count_signals_created_today(db, user.id)
+    remaining = max(quota - used, 0)
+    if remaining == 0:
+        raise HTTPException(status_code=429, detail="quota_exhausted")
+
+    # latest is just a summary, but still bound by what's left today
+    eff_limit = min(limit, remaining)
+    rows = crud.list_latest_signals(db, user.id, limit=eff_limit)
+    if resp:
+        resp.headers["X-Quota-Limit"] = str(quota)
+        resp.headers["X-Quota-Remaining"] = str(remaining - len(rows))
     return rows
 
 # ---- Trades ----

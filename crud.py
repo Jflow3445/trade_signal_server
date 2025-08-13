@@ -2,12 +2,13 @@ from __future__ import annotations
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Iterable, List, Dict, Any
-
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from models import (
     User, TradeSignal, LatestSignal, TradeRecord, Activation,
     OpenPosition, ReferralBoost
 )
+import models
 from schemas import TradeSignalCreate, TradeRecordCreate, EAOpenPosition
 
 UTC = timezone.utc
@@ -164,6 +165,16 @@ def create_trade_record(db: Session, trade: TradeRecordCreate, user_id: int) -> 
     db.commit()
     db.refresh(tr)
     return tr
+
+def count_signals_created_today(db: Session, user_id: int) -> int:
+    start = now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return (
+        db.query(func.count(models.TradeSignal.id))
+          .filter(models.TradeSignal.user_id == user_id,
+                  models.TradeSignal.created_at >= start)
+          .scalar()
+          or 0
+    )
 
 # ---------- EA activations / positions ----------
 def touch_activation(db: Session, user_id: int, account_id: str, broker_server: str, hwid: Optional[str]) -> Activation:
