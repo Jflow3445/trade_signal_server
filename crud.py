@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Iterable, List, Dict, Any
@@ -176,6 +177,26 @@ def count_signals_created_today(db: Session, user_id: int) -> int:
     return (
         db.query(func.count(models.TradeSignal.id))
           .filter(models.TradeSignal.user_id == user_id,
+                  models.TradeSignal.created_at >= start)
+          .scalar()
+          or 0
+    )
+
+def count_signals_consumed_today(db: Session, user_id: int) -> int:
+    """Count how many signals this user has consumed (retrieved) today"""
+    # For now, we'll track this based on signal creation by the sender
+    # since we don't have a separate consumption tracking table yet
+    sender_user = db.query(models.User).filter(
+        models.User.username == os.getenv("SIGNAL_SENDER_USERNAME", "farm_robot").strip().lower()
+    ).first()
+    
+    if not sender_user:
+        return 0
+        
+    start = now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return (
+        db.query(func.count(models.TradeSignal.id))
+          .filter(models.TradeSignal.user_id == sender_user.id,
                   models.TradeSignal.created_at >= start)
           .scalar()
           or 0
