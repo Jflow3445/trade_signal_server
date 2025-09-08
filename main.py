@@ -173,7 +173,11 @@ def get_signals(
 
     # cap page size to remaining
     eff_limit = min(limit, remaining)
-    rows = crud.list_signals(db, user.id, limit=eff_limit)
+    sender = db.query(models.User).filter(models.User.username == SENDER_USERNAME).one_or_none()
+    if not sender:
+        raise HTTPException(status_code=500, detail="sender_user_not_found")
+    rows = crud.list_signals(db, sender.id, limit=eff_limit)
+
     if resp:
         resp.headers["X-Quota-Limit"] = str(quota)
         resp.headers["X-Quota-Remaining"] = str(remaining - len(rows))
@@ -206,7 +210,11 @@ def get_latest(
 
     # latest is just a summary, but still bound by what's left today
     eff_limit = min(limit, remaining)
-    rows = crud.list_latest_signals(db, user.id, limit=eff_limit)
+    sender = db.query(models.User).filter(models.User.username == SENDER_USERNAME).one_or_none()
+    if not sender:
+        raise HTTPException(status_code=500, detail="sender_user_not_found")
+    rows = crud.list_latest_signals(db, sender.id, limit=eff_limit)
+
     if resp:
         resp.headers["X-Quota-Limit"] = str(quota)
         resp.headers["X-Quota-Remaining"] = str(remaining - len(rows))
