@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Iterable, List, Dict, Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert   # <— add this
 from models import (
     User, TradeSignal, LatestSignal, TradeRecord, Activation,
     OpenPosition, ReferralBoost
@@ -80,11 +82,6 @@ def user_by_email(db: Session, email: str) -> Optional[User]:
 
 # ---------- Referral boost ----------
 def get_active_referral_boost(db: Session, user_id: int) -> Optional[ReferralBoost]:
-    """
-    Returns an active referral boost record if current time is within [start_at, end_at)
-    and not revoked. If multiple overlaps exist, return the one with the highest boost (gold > silver),
-    breaking ties by latest end_at.
-    """
     now_ts = now()
     boosts = (db.query(ReferralBoost)
                 .filter(
@@ -104,7 +101,8 @@ def get_active_referral_boost(db: Session, user_id: int) -> Optional[ReferralBoo
 
 # ---------- Signals ----------
 def create_signal(db: Session, user_id: int, s: TradeSignalCreate) -> TradeSignal:
-    sig = TradeSignal(
+    # 1) append to history
+    sig = models.TradeSignal(
         user_id=user_id,
         symbol=s.symbol,
         action=s.action,
@@ -114,22 +112,29 @@ def create_signal(db: Session, user_id: int, s: TradeSignalCreate) -> TradeSigna
         details=s.details,
     )
     db.add(sig)
-    # upsert latest
-    latest = (db.query(LatestSignal)
-                .filter(LatestSignal.user_id == user_id, LatestSignal.symbol == s.symbol)
-                .one_or_none())
-    if latest:
-        latest.action = s.action
-        latest.sl_pips = s.sl_pips
-        latest.tp_pips = s.tp_pips
-        latest.lot_size = s.lot_size
-        latest.details = s.details
-    else:
-        latest = LatestSignal(
-            user_id=user_id, symbol=s.symbol, action=s.action,
-            sl_pips=s.sl_pips, tp_pips=s.tp_pips, lot_size=s.lot_size, details=s.details
-        )
-        db.add(latest)
+    db.flush()
+
+    # 2) upsert latest by (user_id, symbol)
+    stmt = insert(models.LatestSignal).values(
+        user_id=user_id,
+        symbol=s.symbol,
+        action=s.action,
+        sl_pips=s.sl_pips,
+        tp_pips=s.tp_pips,
+        lot_size=s.lot_size,
+        details=s.details,
+    ).on_conflict_do_update(
+        index_elements=["user_id", "symbol"],
+        set_={
+            "action":   s.action,
+            "sl_pips":  s.sl_pips,
+            "tp_pips":  s.tp_pips,
+            "lot_size": s.lot_size,
+            "details":  s.details,
+            "updated_at": func.now(),
+        },
+    )
+    db.execute(stmt)
     db.commit()
     db.refresh(sig)
     return sig

@@ -24,6 +24,20 @@ from schemas import (
 Base.metadata.create_all(bind=engine)  # Use Alembic for real migrations in prod
 app = FastAPI(title="Nister Trade Server", version="2.0.1")
 
+# --- Single-sender config ---
+# Only this username is allowed to POST signals/trades/ea endpoints.
+# You can override via /etc/nister.env: SIGNAL_SENDER_USERNAME=farm_robot
+SENDER_USERNAME = os.getenv("SIGNAL_SENDER_USERNAME", "farm_robot").strip().lower()
+
+def _is_sender(user: models.User) -> bool:
+    return (user.username or "").strip().lower() == SENDER_USERNAME
+
+def _require_sender(user: models.User) -> None:
+    if not _is_sender(user):
+        # 403 (forbidden): token is valid but not allowed to publish
+        raise HTTPException(status_code=403, detail="Only designated sender can publish")
+
+
 # ---------------- Logging ----------------
 logger = logging.getLogger("trade_server")
 logger.setLevel(logging.INFO)
@@ -114,12 +128,20 @@ def healthz() -> Dict[str, str]:
 
 # ---- Signals ----
 @app.post("/signals", response_model=TradeSignalOut)
-def post_signal(payload: TradeSignalCreate, token: str = Depends(get_api_token), db: Session = Depends(get_db)):
+def post_signal(
+    payload: TradeSignalCreate,
+    token: str = Depends(get_api_token),
+    db: Session = Depends(get_db),
+):
     user = crud.user_by_token(db, token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
+    # Only the designated sender can publish
+    _require_sender(user)
+
     if payload.action not in ACTIONABLE:
         raise HTTPException(status_code=400, detail="Unsupported action")
+
     sig = crud.create_signal(db, user_id=user.id, s=payload)
     return sig
 
@@ -234,15 +256,32 @@ def validate(req: ValidateRequest, db: Session = Depends(get_db)):
 
 # ---- EA: sync open positions ----
 @app.post("/ea/sync_open_positions", response_model=EASyncResponse)
-def ea_sync_positions(payload: EASyncRequest, token: str = Depends(get_api_token), db: Session = Depends(get_db)):
+def ea_sync_positions(
+    payload: EASyncRequest,
+    token: str = Depends(get_api_token),
+    db: Session = Depends(get_db),
+):
     user = crud.user_by_token(db, token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
-    crud.touch_activation(db, user_id=user.id, account_id=payload.account_id,
-                          broker_server=payload.broker_server, hwid=None)
+
+    # NOTE: Do NOT call _require_sender(user) here.
+    # Any authenticated user may sync their positions so the server
+    # can track/reflect SL/TP/volume changes for them.
+
+    crud.touch_activation(
+        db,
+        user_id=user.id,
+        account_id=payload.account_id,
+        broker_server=payload.broker_server,
+        hwid=None,
+    )
     upserted = crud.upsert_open_positions(
-        db, user_id=user.id, account_id=payload.account_id, broker_server=payload.broker_server,
-        positions=payload.positions
+        db,
+        user_id=user.id,
+        account_id=payload.account_id,
+        broker_server=payload.broker_server,
+        positions=payload.positions,
     )
     return EASyncResponse(ok=True, upserted=upserted)
 
