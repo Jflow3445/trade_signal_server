@@ -149,102 +149,50 @@ def post_signal(
 
 @app.get("/signals", response_model=List[TradeSignalOut])
 def get_signals(
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(100, ge=1, le=500),
+    max_age_minutes: int = Query(3, ge=1, le=60),
     token: str = Depends(get_api_token),
     db: Session = Depends(get_db),
-    resp: Response = None,
 ):
+    # Authenticate any active user with valid token
     user = crud.user_by_token(db, token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
-
-    # Get sender user first (needed for both unlimited and limited users)
-    sender = db.query(models.User).filter(models.User.username == SENDER_USERNAME).one_or_none()
+    
+    # Fetch signals from the designated sender account
+    sender = db.query(models.User).filter(
+        models.User.username == SENDER_USERNAME,
+        models.User.is_active == True
+    ).one_or_none()
     if not sender:
-        raise HTTPException(status_code=500, detail="sender_user_not_found")
-
-    eff = _effective_plan_and_quota(db, user)
-    quota = eff["daily_quota"]  # None means unlimited
+        raise HTTPException(status_code=500, detail=f"Sender user '{SENDER_USERNAME}' not found")
     
-    if quota is None:
-        # Unlimited users get all available fresh signals (max 1 minute old)
-        rows = crud.list_signals(db, sender.id, limit=limit, max_age_minutes=1)
-        if resp:
-            resp.headers["X-Quota-Limit"] = "unlimited"
-            resp.headers["X-Quota-Remaining"] = "unlimited"
-        return rows
-
-    # For limited users, check quota first
-    granted = crud.check_and_consume_quota(db, token, limit, quota)
-    
-    if granted == 0:
-        # Quota exhausted
-        if resp:
-            resp.headers["X-Quota-Limit"] = str(quota)
-            resp.headers["X-Quota-Remaining"] = "0"
-        raise HTTPException(status_code=429, detail="daily_quota_exhausted")
-    
-    # Retrieve fresh signals (max 1 minute old)
-    rows = crud.list_signals(db, sender.id, limit=granted, max_age_minutes=1)
-    
-    # Only consume quota for signals actually returned
-    crud.consume_quota_for_signals(db, token, len(rows))
-    
-    if resp:
-        consumed_after = crud.get_daily_consumption(db, token)
-        remaining = max(quota - consumed_after, 0)
-        resp.headers["X-Quota-Limit"] = str(quota)
-        resp.headers["X-Quota-Remaining"] = str(remaining)
+    # Get fresh signals from sender
+    rows = crud.list_signals(db, sender.id, limit=limit, max_age_minutes=max_age_minutes)
     return rows
 
 @app.get("/signals/latest", response_model=List[LatestSignalOut])
 def get_latest(
     limit: int = Query(50, ge=1, le=200),
+    max_age_minutes: int = Query(3, ge=1, le=60),
     token: str = Depends(get_api_token),
     db: Session = Depends(get_db),
-    resp: Response = None,
 ):
+    # Authenticate any active user with valid token
     user = crud.user_by_token(db, token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
-
-    # Get sender user first (needed for both unlimited and limited users)
-    sender = db.query(models.User).filter(models.User.username == SENDER_USERNAME).one_or_none()
+    
+    # Fetch signals from the designated sender account
+    sender = db.query(models.User).filter(
+        models.User.username == SENDER_USERNAME,
+        models.User.is_active == True
+    ).one_or_none()
     if not sender:
-        raise HTTPException(status_code=500, detail="sender_user_not_found")
-
-    eff = _effective_plan_and_quota(db, user)
-    quota = eff["daily_quota"]
+        raise HTTPException(status_code=500, detail=f"Sender user '{SENDER_USERNAME}' not found")
     
-    if quota is None:
-        # Unlimited users get all available fresh signals (max 1 minute old)
-        rows = crud.list_latest_signals(db, sender.id, limit=limit, max_age_minutes=1)
-        if resp:
-            resp.headers["X-Quota-Limit"] = "unlimited"
-            resp.headers["X-Quota-Remaining"] = "unlimited"
-        return rows
-
-    # For limited users, check quota first
-    granted = crud.check_and_consume_quota(db, token, limit, quota)
-    
-    if granted == 0:
-        # Quota exhausted
-        if resp:
-            resp.headers["X-Quota-Limit"] = str(quota)
-            resp.headers["X-Quota-Remaining"] = "0"
-        raise HTTPException(status_code=429, detail="daily_quota_exhausted")
-    
-    # Retrieve fresh latest signals (max 1 minute old)
-    rows = crud.list_latest_signals(db, sender.id, limit=granted, max_age_minutes=1)
-    
-    # Only consume quota for signals actually returned
-    crud.consume_quota_for_signals(db, token, len(rows))
-    
-    if resp:
-        consumed_after = crud.get_daily_consumption(db, token)
-        remaining = max(quota - consumed_after, 0)
-        resp.headers["X-Quota-Limit"] = str(quota)
-        resp.headers["X-Quota-Remaining"] = str(remaining)
+    # Get fresh latest signals from sender
+    rows = crud.list_latest_signals(db, sender.id, limit=limit, max_age_minutes=max_age_minutes)
     return rows
 
 # ---- Trades ----

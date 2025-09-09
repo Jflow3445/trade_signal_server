@@ -186,35 +186,35 @@ def count_signals_created_today(db: Session, user_id: int) -> int:
           or 0
     )
 
-def get_daily_consumption(db: Session, api_key: str) -> int:
-    """Get how many signals this API key has consumed today"""
+def get_daily_consumption(db: Session, user_id: int) -> int:
+    """Get how many signals this user has consumed today"""
     today = now().date()
     consumption = (
         db.query(DailyConsumption)
-        .filter(DailyConsumption.api_key == api_key, DailyConsumption.date == today)
+        .filter(DailyConsumption.user_id == user_id, DailyConsumption.date == today)
         .first()
     )
     return consumption.signals_consumed if consumption else 0
 
-def record_signal_consumption(db: Session, api_key: str, count: int) -> None:
+def record_signal_consumption(db: Session, user_id: int, count: int) -> None:
     """Record signal consumption for quota tracking"""
     today = now().date()
     
     # Use upsert to handle concurrent updates
     stmt = insert(DailyConsumption).values(
-        api_key=api_key,
+        user_id=user_id,
         date=today,
         signals_consumed=count
     ).on_conflict_do_update(
-        index_elements=["api_key", "date"],
+        index_elements=["user_id", "date"],
         set_={"signals_consumed": DailyConsumption.signals_consumed + count, "updated_at": func.now()}
     )
     db.execute(stmt)
     db.commit()
 
-def check_and_consume_quota(db: Session, api_key: str, requested: int, daily_quota: int) -> int:
+def check_and_consume_quota(db: Session, user_id: int, requested: int, daily_quota: int) -> int:
     """Check quota and return how many signals can be consumed, then record consumption"""
-    consumed_today = get_daily_consumption(db, api_key)
+    consumed_today = get_daily_consumption(db, user_id)
     remaining = max(daily_quota - consumed_today, 0)
     
     if remaining == 0:
@@ -224,10 +224,10 @@ def check_and_consume_quota(db: Session, api_key: str, requested: int, daily_quo
     granted = min(requested, remaining)
     return granted
 
-def consume_quota_for_signals(db: Session, api_key: str, actual_signals_returned: int) -> None:
+def consume_quota_for_signals(db: Session, user_id: int, actual_signals_returned: int) -> None:
     """Record consumption for signals that were actually returned to user"""
     if actual_signals_returned > 0:
-        record_signal_consumption(db, api_key, actual_signals_returned)
+        record_signal_consumption(db, user_id, actual_signals_returned)
 
 # ---------- EA activations / positions ----------
 def touch_activation(db: Session, user_id: int, account_id: str, broker_server: str, hwid: Optional[str]) -> Activation:
