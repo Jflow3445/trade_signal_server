@@ -1,37 +1,66 @@
-from typing import Any, Optional, List, Dict
-from pydantic import BaseModel, Field, EmailStr
+from typing import Optional, Any
+import datetime
+from pydantic import BaseModel
 
 
-# ---------- /validate ----------
-class ValidateRequest(BaseModel):
-    email: EmailStr
+# ----------------------------
+# User schemas
+# ----------------------------
+
+class UserBase(BaseModel):
+    username: str
+    email: Optional[str] = None
+
+class UserCreate(UserBase):
     api_key: str
-
-
-class ValidateResponse(BaseModel):
-    ok: bool
-    is_active: bool
-    plan: Optional[str] = None
+    plan: str = "free"
     daily_quota: Optional[int] = None
-    expires_at: Optional[str] = None  # keep for compatibility
+    is_active: bool = True
+    expires_at: Optional[datetime.datetime] = None
 
-
-# ---------- /signals ----------
-class SignalCreate(BaseModel):
-    symbol: str
-    action: str
-    sl_pips: Optional[int] = Field(default=None, ge=0)
-    tp_pips: Optional[int] = Field(default=None, ge=0)
-    lot_size: Optional[float] = None
-    details: Optional[Dict[str, Any]] = None
-
-
-class SignalOut(BaseModel):
+class User(UserBase):
     id: int
+    api_key: str
+    plan: str
+    daily_quota: Optional[int]
+    is_active: bool
+    expires_at: Optional[datetime.datetime]
+
+    class Config:
+        orm_mode = True
+
+
+# ----------------------------
+# Signal schemas
+# ----------------------------
+
+class SignalBase(BaseModel):
     symbol: str
     action: str
     sl_pips: Optional[int] = None
     tp_pips: Optional[int] = None
     lot_size: Optional[float] = None
-    details: Optional[Dict[str, Any]] = None
-    created_at: str
+    details: Optional[Any] = None
+
+class SignalCreate(SignalBase):
+    pass
+
+class Signal(SignalBase):
+    id: int
+    created_at: datetime.datetime
+
+    class Config:
+        orm_mode = True
+
+
+# ----------------------------
+# Subscription schemas
+# ----------------------------
+
+class Subscription(BaseModel):
+    id: int
+    receiver_id: int
+    sender_id: int
+
+    class Config:
+        orm_mode = True
