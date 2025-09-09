@@ -1,85 +1,90 @@
+# models.py
 from __future__ import annotations
+from datetime import datetime, timezone
+from typing import Optional
+
 from sqlalchemy import (
-    Column, Integer, String, Float, DateTime, JSON, ForeignKey, Boolean,
-    UniqueConstraint, Index, text, Date
+    Column, Integer, String, Boolean, DateTime, Date, Float, JSON,
+    UniqueConstraint, Index, Text
 )
-from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
-from database import Base
+from sqlalchemy.orm import declarative_base
 
-# All timestamps are timezone-aware (UTC) at the DB level via timezone=True.
+Base = declarative_base()
 
+UTC = timezone.utc
+def utcnow() -> datetime:
+    return datetime.now(tz=UTC)
+
+# ---------------- Users ----------------
 class User(Base):
     __tablename__ = "users"
+
     id = Column(Integer, primary_key=True)
-    email = Column(String(255), unique=True, index=True, nullable=True)
-    username = Column(String(64), unique=True, index=True, nullable=False)
-    # API token (opaque, Bearer). Store plaintext initially; migrate to hashed later.
-    api_key = Column(String(128), unique=True, index=True, nullable=False)
+    email = Column(String(255), unique=False, nullable=True, index=True)
+    username = Column(String(64), unique=True, nullable=False, index=True)
 
-    # Licensing
-    plan = Column(String(16), nullable=False, server_default=text("'free'"))
-    daily_quota = Column(Integer, nullable=True)  # None means unlimited
+    # IMPORTANT: quotas are accounted per api_key (token), not id/email
+    api_key = Column(String(128), unique=True, nullable=False, index=True)
+
+    plan = Column(String(32), nullable=False, default="free")  # free/silver/gold/...
+    # Optional daily quota override; None = use plan default; also None can mean unlimited
+    daily_quota = Column(Integer, nullable=True)
+
+    is_active = Column(Boolean, default=True, nullable=False)
+    is_admin = Column(Boolean, default=False, nullable=False)
+
     expires_at = Column(DateTime(timezone=True), nullable=True)
-    is_active = Column(Boolean, nullable=False, server_default=text("true"))
 
-    # Meta
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
-    signals = relationship("TradeSignal", back_populates="user", cascade="all,delete-orphan")
-    trades = relationship("TradeRecord", back_populates="user", cascade="all,delete-orphan")
-    latest_signals = relationship("LatestSignal", back_populates="user", cascade="all,delete-orphan")
-    activations = relationship("Activation", back_populates="user", cascade="all,delete-orphan")
-    referral_boosts = relationship("ReferralBoost", back_populates="user", cascade="all,delete-orphan")
-
-
+# --------------- Signals (history) ---------------
 class TradeSignal(Base):
     __tablename__ = "trade_signals"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
 
-    symbol = Column(String(32), index=True, nullable=False)
-    action = Column(String(32), nullable=False)  # buy/sell/adjust_sl/adjust_tp/close/close_all/hold/do_nothing
-    sl_pips = Column(Integer, nullable=False)
-    tp_pips = Column(Integer, nullable=False)
-    lot_size = Column(Float, nullable=False)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)  # sender id
+    symbol = Column(String(32), nullable=False, index=True)
+    action = Column(String(16), nullable=False)            # buy/sell/adjust_sl/adjust_tp/close/hold
+    sl_pips = Column(Integer, nullable=False, default=1)
+    tp_pips = Column(Integer, nullable=False, default=1)
+    lot_size = Column(Float, nullable=False, default=0.01)
     details = Column(JSON, nullable=True)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-    user = relationship("User", back_populates="signals")
-
-
-class LatestSignal(Base):
-    __tablename__ = "latest_signals"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-
-    symbol = Column(String(32), index=True, nullable=False)
-    action = Column(String(32), nullable=False)
-    sl_pips = Column(Integer, nullable=False)
-    tp_pips = Column(Integer, nullable=False)
-    lot_size = Column(Float, nullable=False)
-    details = Column(JSON, nullable=True)
-
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    user = relationship("User", back_populates="latest_signals")
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     __table_args__ = (
-        UniqueConstraint("user_id", "symbol", name="uq_latest_by_user_symbol"),
+        Index("ix_trade_signals_user_created", "user_id", "created_at"),
+    )
+
+# --------------- Latest per (user, symbol) ---------------
+class LatestSignal(Base):
+    __tablename__ = "latest_signals"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)  # sender id
+    symbol = Column(String(32), nullable=False, index=True)
+    action = Column(String(16), nullable=False)
+    sl_pips = Column(Integer, nullable=False, default=1)
+    tp_pips = Column(Integer, nullable=False, default=1)
+    lot_size = Column(Float, nullable=False, default=0.01)
+    details = Column(JSON, nullable=True)
+
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "symbol", name="uq_latest_user_symbol"),
         Index("ix_latest_user_updated", "user_id", "updated_at"),
     )
 
-
+# --------------- Trades log (optional) ---------------
 class TradeRecord(Base):
     __tablename__ = "trade_records"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
 
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)
     symbol = Column(String(32), nullable=False)
-    side = Column(String(8), nullable=False)  # buy/sell
+    side = Column(String(16), nullable=False)  # buy/sell
     entry_price = Column(Float, nullable=False)
     exit_price = Column(Float, nullable=True)
     volume = Column(Float, nullable=False)
@@ -89,45 +94,69 @@ class TradeRecord(Base):
     close_time = Column(DateTime(timezone=True), nullable=True)
     details = Column(JSON, nullable=True)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
-    user = relationship("User", back_populates="trades")
+# --------------- Referral boost (optional) ---------------
+class ReferralBoost(Base):
+    __tablename__ = "referral_boosts"
 
-
-class Activation(Base):
-    """
-    Records EA activations (accounts/devices) for a user, with limits.
-    """
-    __tablename__ = "activations"
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
 
-    account_id = Column(String(64), nullable=False)     # MT5 account number string
-    broker_server = Column(String(128), nullable=False) # Broker server name
-    hwid = Column(String(128), nullable=True)
+    # "silver" or "gold"
+    boost_to = Column(String(16), nullable=False)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    last_seen_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    start_at = Column(DateTime(timezone=True), nullable=False)
+    end_at = Column(DateTime(timezone=True), nullable=False)
 
-    user = relationship("User", back_populates="activations")
+    is_revoked = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+# --------------- Daily consumption (token-bound) ---------------
+class DailyConsumption(Base):
+    """
+    Quota accounting is per API token (api_key) and per day.
+    We deliberately avoid a foreign key to users.api_key, because tokens rotate;
+    we want historical rows to remain valid while a new token starts a fresh day counter.
+    """
+    __tablename__ = "daily_consumption"
+
+    id = Column(Integer, primary_key=True)
+    api_key = Column(String(128), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+    signals_consumed = Column(Integer, nullable=False, default=0)
+
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
     __table_args__ = (
-        UniqueConstraint("user_id", "account_id", "broker_server", name="uq_activation_user_acct_server"),
+        UniqueConstraint("api_key", "date", name="uq_consumption_api_key_date"),
     )
 
+# --------------- EA bookkeeping (optional) ---------------
+class Activation(Base):
+    __tablename__ = "activations"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    account_id = Column(String(64), nullable=False, index=True)
+    broker_server = Column(String(128), nullable=False, index=True)
+    hwid = Column(Text, nullable=True)
+
+    last_seen_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_activation_user_account_server", "user_id", "account_id", "broker_server"),
+    )
 
 class OpenPosition(Base):
-    """
-    Optional: EA open positions sync storage.
-    """
     __tablename__ = "open_positions"
+
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-
-    account_id = Column(String(64), nullable=False)
-    broker_server = Column(String(128), nullable=False)
-    ticket = Column(Integer, nullable=False)
-
+    user_id = Column(Integer, nullable=False, index=True)
+    account_id = Column(String(64), nullable=False, index=True)
+    broker_server = Column(String(128), nullable=False, index=True)
+    ticket = Column(Integer, nullable=False, index=True)
     symbol = Column(String(32), nullable=False)
     side = Column(String(8), nullable=False)  # buy/sell
     volume = Column(Float, nullable=False)
@@ -138,53 +167,4 @@ class OpenPosition(Base):
     magic = Column(Integer, nullable=True)
     comment = Column(String(255), nullable=True)
 
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    user = relationship("User")
-
-    __table_args__ = (
-        UniqueConstraint("user_id","account_id","broker_server","ticket", name="uq_openpos_user_acct_server_ticket"),
-        Index("ix_openpos_user_updated", "user_id", "updated_at"),
-    )
-
-
-class ReferralBoost(Base):
-    """
-    Temporary plan boost awarded by referrals.
-    boost_to: one of 'silver' or 'gold' (one-tier upgrade target).
-    """
-    __tablename__ = "referral_boosts"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    boost_to = Column(String(16), nullable=False)  # "silver" or "gold"
-    start_at = Column(DateTime(timezone=True), nullable=False)
-    end_at = Column(DateTime(timezone=True), nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    is_revoked = Column(Boolean, nullable=False, server_default=text("false"))
-
-    user = relationship("User", back_populates="referral_boosts")
-
-    __table_args__ = (
-        Index("ix_refboost_user_window", "user_id", "start_at", "end_at"),
-    )
-
-
-class DailyConsumption(Base):
-    """
-    Tracks daily signal consumption per user for quota enforcement.
-    """
-    __tablename__ = "daily_consumption"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    date = Column(Date, nullable=False)
-    signals_consumed = Column(Integer, nullable=False, server_default=text("0"))
-    
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    user = relationship("User")
-
-    __table_args__ = (
-        UniqueConstraint("user_id", "date", name="uq_consumption_user_date"),
-        Index("ix_consumption_user_date", "user_id", "date"),
-    )
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
