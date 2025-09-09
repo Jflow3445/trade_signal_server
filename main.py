@@ -174,13 +174,25 @@ def get_signals(
             resp.headers["X-Quota-Remaining"] = "unlimited"
         return rows
 
-    # For limited users, respect their quota
-    eff_limit = min(limit, quota)
-    rows = crud.list_signals(db, sender.id, limit=eff_limit)
-
+    # For limited users, check and consume quota
+    granted = crud.check_and_consume_quota(db, user.id, limit, quota)
+    
+    if granted == 0:
+        # Quota exhausted
+        consumed_today = crud.get_daily_consumption(db, user.id)
+        if resp:
+            resp.headers["X-Quota-Limit"] = str(quota)
+            resp.headers["X-Quota-Remaining"] = "0"
+        raise HTTPException(status_code=429, detail="daily_quota_exhausted")
+    
+    # Retrieve the granted number of signals
+    rows = crud.list_signals(db, sender.id, limit=granted)
+    
     if resp:
+        consumed_after = crud.get_daily_consumption(db, user.id)
+        remaining = max(quota - consumed_after, 0)
         resp.headers["X-Quota-Limit"] = str(quota)
-        resp.headers["X-Quota-Remaining"] = str(max(quota - len(rows), 0))
+        resp.headers["X-Quota-Remaining"] = str(remaining)
     return rows
 
 @app.get("/signals/latest", response_model=List[LatestSignalOut])
@@ -210,13 +222,24 @@ def get_latest(
             resp.headers["X-Quota-Remaining"] = "unlimited"
         return rows
 
-    # For limited users, respect their quota
-    eff_limit = min(limit, quota)
-    rows = crud.list_latest_signals(db, sender.id, limit=eff_limit)
-
+    # For limited users, check and consume quota
+    granted = crud.check_and_consume_quota(db, user.id, limit, quota)
+    
+    if granted == 0:
+        # Quota exhausted
+        if resp:
+            resp.headers["X-Quota-Limit"] = str(quota)
+            resp.headers["X-Quota-Remaining"] = "0"
+        raise HTTPException(status_code=429, detail="daily_quota_exhausted")
+    
+    # Retrieve the granted number of signals
+    rows = crud.list_latest_signals(db, sender.id, limit=granted)
+    
     if resp:
+        consumed_after = crud.get_daily_consumption(db, user.id)
+        remaining = max(quota - consumed_after, 0)
         resp.headers["X-Quota-Limit"] = str(quota)
-        resp.headers["X-Quota-Remaining"] = str(max(quota - len(rows), 0))
+        resp.headers["X-Quota-Remaining"] = str(remaining)
     return rows
 
 # ---- Trades ----

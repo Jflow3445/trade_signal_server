@@ -9,7 +9,7 @@ from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert   # <— add this
 from models import (
     User, TradeSignal, LatestSignal, TradeRecord, Activation,
-    OpenPosition, ReferralBoost
+    OpenPosition, ReferralBoost, DailyConsumption
 )
 import models
 from schemas import TradeSignalCreate, TradeRecordCreate, EAOpenPosition
@@ -182,25 +182,48 @@ def count_signals_created_today(db: Session, user_id: int) -> int:
           or 0
     )
 
-def count_signals_consumed_today(db: Session, user_id: int) -> int:
-    """Count how many signals this user has consumed (retrieved) today"""
-    # For now, we'll track this based on signal creation by the sender
-    # since we don't have a separate consumption tracking table yet
-    sender_user = db.query(models.User).filter(
-        models.User.username == os.getenv("SIGNAL_SENDER_USERNAME", "farm_robot").strip().lower()
-    ).first()
-    
-    if not sender_user:
-        return 0
-        
-    start = now().replace(hour=0, minute=0, second=0, microsecond=0)
-    return (
-        db.query(func.count(models.TradeSignal.id))
-          .filter(models.TradeSignal.user_id == sender_user.id,
-                  models.TradeSignal.created_at >= start)
-          .scalar()
-          or 0
+def get_daily_consumption(db: Session, user_id: int) -> int:
+    """Get how many signals this user has consumed today"""
+    today = now().date()
+    consumption = (
+        db.query(DailyConsumption)
+        .filter(DailyConsumption.user_id == user_id, DailyConsumption.date == today)
+        .first()
     )
+    return consumption.signals_consumed if consumption else 0
+
+def record_signal_consumption(db: Session, user_id: int, count: int) -> None:
+    """Record signal consumption for quota tracking"""
+    today = now().date()
+    
+    # Use upsert to handle concurrent updates
+    stmt = insert(DailyConsumption).values(
+        user_id=user_id,
+        date=today,
+        signals_consumed=count
+    ).on_conflict_do_update(
+        index_elements=["user_id", "date"],
+        set_={"signals_consumed": DailyConsumption.signals_consumed + count, "updated_at": func.now()}
+    )
+    db.execute(stmt)
+    db.commit()
+
+def check_and_consume_quota(db: Session, user_id: int, requested: int, daily_quota: int) -> int:
+    """Check quota and return how many signals can be consumed, then record consumption"""
+    consumed_today = get_daily_consumption(db, user_id)
+    remaining = max(daily_quota - consumed_today, 0)
+    
+    if remaining == 0:
+        return 0
+    
+    # Grant up to remaining quota
+    granted = min(requested, remaining)
+    
+    # Record the consumption
+    if granted > 0:
+        record_signal_consumption(db, user_id, granted)
+    
+    return granted
 
 # ---------- EA activations / positions ----------
 def touch_activation(db: Session, user_id: int, account_id: str, broker_server: str, hwid: Optional[str]) -> Activation:

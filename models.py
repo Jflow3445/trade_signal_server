@@ -1,7 +1,7 @@
 from __future__ import annotations
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, JSON, ForeignKey, Boolean,
-    UniqueConstraint, Index, text
+    UniqueConstraint, Index, text, Date
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -166,4 +166,25 @@ class ReferralBoost(Base):
 
     __table_args__ = (
         Index("ix_refboost_user_window", "user_id", "start_at", "end_at"),
+    )
+
+
+class DailyConsumption(Base):
+    """
+    Tracks daily signal consumption per user for quota enforcement.
+    """
+    __tablename__ = "daily_consumption"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    date = Column(Date, nullable=False)
+    signals_consumed = Column(Integer, nullable=False, server_default=text("0"))
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "date", name="uq_consumption_user_date"),
+        Index("ix_consumption_user_date", "user_id", "date"),
     )
