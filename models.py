@@ -171,20 +171,19 @@ class ReferralBoost(Base):
 
 class DailyConsumption(Base):
     """
-    Tracks daily signal consumption per user for quota enforcement.
+    Tracks daily signal consumption per API key for quota enforcement.
+    This allows immediate quota changes when users upgrade/downgrade plans.
     """
     __tablename__ = "daily_consumption"
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    api_key = Column(String(128), nullable=False, index=True)
     date = Column(Date, nullable=False)
     signals_consumed = Column(Integer, nullable=False, server_default=text("0"))
     
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    user = relationship("User")
-
     __table_args__ = (
-        UniqueConstraint("user_id", "date", name="uq_consumption_user_date"),
-        Index("ix_consumption_user_date", "user_id", "date"),
+        UniqueConstraint("api_key", "date", name="uq_consumption_api_date"),
+        Index("ix_consumption_api_date", "api_key", "date"),
     )

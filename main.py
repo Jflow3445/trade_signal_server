@@ -175,7 +175,7 @@ def get_signals(
         return rows
 
     # For limited users, check quota first
-    granted = crud.check_and_consume_quota(db, user.id, limit, quota)
+    granted = crud.check_and_consume_quota(db, token, limit, quota)
     
     if granted == 0:
         # Quota exhausted
@@ -188,10 +188,10 @@ def get_signals(
     rows = crud.list_signals(db, sender.id, limit=granted, max_age_minutes=1)
     
     # Only consume quota for signals actually returned
-    crud.consume_quota_for_signals(db, user.id, len(rows))
+    crud.consume_quota_for_signals(db, token, len(rows))
     
     if resp:
-        consumed_after = crud.get_daily_consumption(db, user.id)
+        consumed_after = crud.get_daily_consumption(db, token)
         remaining = max(quota - consumed_after, 0)
         resp.headers["X-Quota-Limit"] = str(quota)
         resp.headers["X-Quota-Remaining"] = str(remaining)
@@ -225,7 +225,7 @@ def get_latest(
         return rows
 
     # For limited users, check quota first
-    granted = crud.check_and_consume_quota(db, user.id, limit, quota)
+    granted = crud.check_and_consume_quota(db, token, limit, quota)
     
     if granted == 0:
         # Quota exhausted
@@ -238,10 +238,10 @@ def get_latest(
     rows = crud.list_latest_signals(db, sender.id, limit=granted, max_age_minutes=1)
     
     # Only consume quota for signals actually returned
-    crud.consume_quota_for_signals(db, user.id, len(rows))
+    crud.consume_quota_for_signals(db, token, len(rows))
     
     if resp:
-        consumed_after = crud.get_daily_consumption(db, user.id)
+        consumed_after = crud.get_daily_consumption(db, token)
         remaining = max(quota - consumed_after, 0)
         resp.headers["X-Quota-Limit"] = str(quota)
         resp.headers["X-Quota-Remaining"] = str(remaining)
