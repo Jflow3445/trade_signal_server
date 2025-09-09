@@ -164,38 +164,29 @@ def get_signals(
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+    # Get sender user first (needed for both unlimited and limited users)
+    sender = db.query(models.User).filter(models.User.username == SENDER_USERNAME).one_or_none()
+    if not sender:
+        raise HTTPException(status_code=500, detail="sender_user_not_found")
+
     eff = _effective_plan_and_quota(db, user)
     quota = eff["daily_quota"]  # None means unlimited
+    
     if quota is None:
-        rows = crud.list_signals(db, user.id, limit=limit)
+        # Unlimited users get all available signals
+        rows = crud.list_signals(db, sender.id, limit=limit)
         if resp:
             resp.headers["X-Quota-Limit"] = "unlimited"
             resp.headers["X-Quota-Remaining"] = "unlimited"
         return rows
 
-    # Get available signals from sender
-    sender = db.query(models.User).filter(models.User.username == SENDER_USERNAME).one_or_none()
-    if not sender:
-        raise HTTPException(status_code=500, detail="sender_user_not_found")
-    
-    # Count available signals today
-    available_today = crud.count_signals_created_today(db, sender.id)
-    remaining = max(min(quota, available_today) - 0, 0)  # User hasn't consumed any yet in this simplified model
-    
-    if available_today == 0:
-        # No signals available today
-        if resp:
-            resp.headers["X-Quota-Limit"] = str(quota)
-            resp.headers["X-Quota-Remaining"] = "0"
-        return []
-    
-    # Cap the limit to quota and available signals
-    eff_limit = min(limit, quota, available_today)
+    # For limited users, respect their quota
+    eff_limit = min(limit, quota)
     rows = crud.list_signals(db, sender.id, limit=eff_limit)
 
     if resp:
         resp.headers["X-Quota-Limit"] = str(quota)
-        resp.headers["X-Quota-Remaining"] = str(quota - len(rows))
+        resp.headers["X-Quota-Remaining"] = str(max(quota - len(rows), 0))
     return rows
 
 @app.get("/signals/latest", response_model=List[LatestSignalOut])
@@ -209,37 +200,29 @@ def get_latest(
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+    # Get sender user first (needed for both unlimited and limited users)
+    sender = db.query(models.User).filter(models.User.username == SENDER_USERNAME).one_or_none()
+    if not sender:
+        raise HTTPException(status_code=500, detail="sender_user_not_found")
+
     eff = _effective_plan_and_quota(db, user)
     quota = eff["daily_quota"]
+    
     if quota is None:
-        rows = crud.list_latest_signals(db, user.id, limit=limit)
+        # Unlimited users get all available signals
+        rows = crud.list_latest_signals(db, sender.id, limit=limit)
         if resp:
             resp.headers["X-Quota-Limit"] = "unlimited"
             resp.headers["X-Quota-Remaining"] = "unlimited"
         return rows
 
-    # Get available signals from sender  
-    sender = db.query(models.User).filter(models.User.username == SENDER_USERNAME).one_or_none()
-    if not sender:
-        raise HTTPException(status_code=500, detail="sender_user_not_found")
-    
-    # Count available signals today
-    available_today = crud.count_signals_created_today(db, sender.id)
-    
-    if available_today == 0:
-        # No signals available today
-        if resp:
-            resp.headers["X-Quota-Limit"] = str(quota)
-            resp.headers["X-Quota-Remaining"] = "0"
-        return []
-    
-    # Cap the limit to quota and available signals
-    eff_limit = min(limit, quota, available_today)
+    # For limited users, respect their quota
+    eff_limit = min(limit, quota)
     rows = crud.list_latest_signals(db, sender.id, limit=eff_limit)
 
     if resp:
         resp.headers["X-Quota-Limit"] = str(quota)
-        resp.headers["X-Quota-Remaining"] = str(quota - len(rows))
+        resp.headers["X-Quota-Remaining"] = str(max(quota - len(rows), 0))
     return rows
 
 # ---- Trades ----
