@@ -1,25 +1,24 @@
-# database.py
 import os
+from urllib.parse import urlparse
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./trade_signals.db")
+# --- DB URL (Postgres required) ---
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is required")
 
-# Pre-ping so dead connections are recycled
+scheme = urlparse(DATABASE_URL).scheme.lower()
+if not scheme.startswith("postgresql"):
+    raise RuntimeError(f"Only Postgres is supported here. Got scheme '{scheme}'")
+
+# --- Engine / Session / Base ---
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=5,
     future=True,
 )
-
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
-
-
-def get_db():
-    """FastAPI dependency to get a DB session."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()

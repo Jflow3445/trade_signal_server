@@ -1,43 +1,37 @@
-# schemas.py
-from typing import Optional, List, Any
-from pydantic import BaseModel, Field
-from datetime import datetime
+from typing import Any, Optional, List, Dict
+from pydantic import BaseModel, Field, EmailStr
 
 
-# ---------- Validate ----------
+# ---------- /validate ----------
 class ValidateRequest(BaseModel):
-    email: str
+    email: EmailStr
     api_key: str
 
 
 class ValidateResponse(BaseModel):
     ok: bool
-    is_active: bool = True
-    plan: str = "free"
-    daily_quota: Optional[int] = 1  # None/0 = unlimited
-    expires_at: Optional[datetime] = None
+    is_active: bool
+    plan: Optional[str] = None
+    daily_quota: Optional[int] = None
+    expires_at: Optional[str] = None  # keep for compatibility
 
 
-# ---------- Signal (POST from sender) ----------
-class SignalIn(BaseModel):
+# ---------- /signals ----------
+class SignalCreate(BaseModel):
     symbol: str
     action: str
-    sl_pips: Optional[int] = 0
-    tp_pips: Optional[int] = 0
-    lot_size: Optional[float] = 0.0
-    details: Optional[Any] = None
+    sl_pips: Optional[int] = Field(default=None, ge=0)
+    tp_pips: Optional[int] = Field(default=None, ge=0)
+    lot_size: Optional[float] = None
+    details: Optional[Dict[str, Any]] = None
 
 
 class SignalOut(BaseModel):
     id: int
     symbol: str
     action: str
-    sl_pips: Optional[int] = 0
-    tp_pips: Optional[int] = 0
-    lot_size: Optional[float] = 0.0
-    details: Optional[Any] = None
-    created_at: datetime
-
-
-class SignalsResponse(BaseModel):
-    signals: List[SignalOut] = Field(default_factory=list)
+    sl_pips: Optional[int] = None
+    tp_pips: Optional[int] = None
+    lot_size: Optional[float] = None
+    details: Optional[Dict[str, Any]] = None
+    created_at: str

@@ -1,79 +1,67 @@
-# models.py
 from datetime import datetime
 from sqlalchemy import (
-    Column, Integer, String, Boolean, DateTime, Text, ForeignKey,
-    JSON, UniqueConstraint, Index
+    Column, Integer, String, Boolean, DateTime, ForeignKey, UniqueConstraint, Index
 )
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.sql import func
+
 from database import Base
 
 
 class User(Base):
     __tablename__ = "users"
-
-    id          = Column(Integer, primary_key=True, index=True)
-    username    = Column(String, nullable=False, unique=True)
-    email       = Column(String, nullable=True, unique=False, index=True)
-    api_key     = Column(String, nullable=False, unique=True, index=True)
+    id          = Column(Integer, primary_key=True)
+    username    = Column(String(64), nullable=False, unique=True)
+    email       = Column(String(255), nullable=True, unique=False)
+    api_key     = Column(String(128), nullable=False, unique=True, index=True)
     is_active   = Column(Boolean, nullable=False, default=True)
-    expires_at  = Column(DateTime(timezone=True), nullable=True)
-    plan        = Column(String, nullable=True, default="free")
-    daily_quota = Column(Integer, nullable=True)  # None means use plan default
 
-    # relationships (not strictly required for queries)
-    signals     = relationship("TradeSignal", back_populates="user", lazy="selectin")
+    # Plan / quota (NULL daily_quota => unlimited)
+    plan                = Column(String(16), nullable=True)       # 'free' | 'silver' | 'gold'
+    daily_quota         = Column(Integer, nullable=True)          # 1 | 3 | NULL (unlimited)
+    plan_upgraded_at    = Column(DateTime(timezone=True), nullable=True)
+
+    created_at  = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    sent_signals = relationship("TradeSignal", back_populates="sender", lazy="selectin")
+
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+    id           = Column(Integer, primary_key=True)
+    receiver_id  = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    sender_id    = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("receiver_id", "sender_id", name="uniq_subscription"),
+    )
 
 
 class TradeSignal(Base):
     __tablename__ = "trade_signals"
-
-    id         = Column(Integer, primary_key=True, index=True)
-    symbol     = Column(String, nullable=False)
-    action     = Column(String, nullable=False)  # 'buy','sell','adjust_sl','adjust_tp','close','hold'
+    id         = Column(Integer, primary_key=True)
+    user_id    = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)  # sender
+    symbol     = Column(String(32), nullable=False)
+    action     = Column(String(16), nullable=False)  # buy|sell|adjust_sl|adjust_tp|close|hold
     sl_pips    = Column(Integer, nullable=True)
     tp_pips    = Column(Integer, nullable=True)
-    lot_size   = Column(Integer, nullable=True)  # often double precision in PG; int okay if you send scaled
-    details    = Column(JSON, nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
-    user_id    = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    lot_size   = Column(String(32), nullable=True)   # keep as text or numeric; many brokers use decimals
+    details    = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    user       = relationship("User", back_populates="signals", lazy="joined")
-
-
-Index("idx_trade_signals_user_created", TradeSignal.user_id, TradeSignal.created_at.desc())
-
-
-class Subscription(Base):
-    """
-    Who may receive whose signals.
-    (receiver_id, sender_id) is the natural PK; both reference users.id
-    """
-    __tablename__ = "subscriptions"
-
-    receiver_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
-    sender_id   = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
-    created_at  = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
-
-    # optional relationships:
-    # receiver = relationship("User", foreign_keys=[receiver_id])
-    # sender   = relationship("User", foreign_keys=[sender_id])
-
-
-Index("idx_subscriptions_receiver", Subscription.receiver_id)
-Index("idx_subscriptions_sender",   Subscription.sender_id)
+    sender = relationship("User", back_populates="sent_signals")
 
 
 class SignalRead(Base):
-    """
-    Ledger of which token has been delivered which signal (consumes quota for buy/sell).
-    """
     __tablename__ = "signal_reads"
+    id          = Column(Integer, primary_key=True)
+    signal_id   = Column(Integer, ForeignKey("trade_signals.id", ondelete="CASCADE"), nullable=False)
+    receiver_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)   # optional
+    token_hash  = Column(String(128), nullable=True)  # sha256 of Bearer token (per-token accounting)
+    read_at     = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    id         = Column(Integer, primary_key=True)
-    token_hash = Column(String, nullable=False, index=True)
-    signal_id  = Column(Integer, ForeignKey("trade_signals.id", ondelete="CASCADE"), nullable=False, index=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
-
+    # IMPORTANT: Avoid double-counting the same signal for the same token
     __table_args__ = (
-        UniqueConstraint("token_hash", "signal_id", name="uq_signal_reads_token_signal"),
+        Index("uniq_signal_reads_token_signal", "token_hash", "signal_id", unique=True, postgresql_where=(token_hash != None)),
     )

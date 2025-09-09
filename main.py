@@ -1,27 +1,37 @@
-import hashlib
+import os
+import json
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import FastAPI, Depends, Request, Response, HTTPException, status
+from fastapi import FastAPI, Depends, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
 from sqlalchemy.orm import Session
 
-from database import SessionLocal
-import crud
+from database import engine, SessionLocal, Base
+from models import User, TradeSignal
+from schemas import ValidateRequest, ValidateResponse, SignalCreate, SignalOut
+from crud import (
+    get_user_by_email_and_token,
+    get_user_by_token,
+    create_signal,
+    fetch_signals_for_receiver_with_quota,
+)
 
+# ---------------- App / DB init ----------------
+Base.metadata.create_all(bind=engine)  # in prod use Alembic
+app = FastAPI(title="Nister Trade Server", version="2.1.0")
 
-app = FastAPI(title="Trade Signal Server", version="1.0.0")
-
-# CORS (adjust as needed)
+# ---------------- CORS (safe default) ----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
     allow_headers=["*"],
+    allow_methods=["*"],
 )
 
-# ---------------- DB dependency ----------------
+# ---------------- Dependency ----------------
 def get_db():
     db = SessionLocal()
     try:
@@ -30,159 +40,92 @@ def get_db():
         db.close()
 
 
-# ---------------- Helpers ----------------
-def bearer_from_request(request: Request) -> str:
-    auth = request.headers.get("Authorization", "")
-    if not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing Bearer token")
-    token = auth.split(" ", 1)[1].strip()
-    if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Bearer token")
-    return token
+# ---------------- Utilities ----------------
+def bearer_token(auth_header: Optional[str]) -> str:
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    return auth_header.split(" ", 1)[1].strip()
 
 
-def sha256_hex(s: str) -> str:
-    import hashlib as _h
-    return _h.sha256(s.encode("utf-8")).hexdigest()
-
-
-# ---------------- Schemas ----------------
-class ValidateIn(BaseModel):
-    email: str
-    api_key: str
-
-
-class SignalIn(BaseModel):
-    symbol: str = Field(..., min_length=3, max_length=32)
-    action: str = Field(..., pattern=r"^(buy|sell|adjust_sl|adjust_tp|close|hold)$")
-    sl_pips: int = Field(..., ge=1)
-    tp_pips: int = Field(..., ge=1)
-    lot_size: float = Field(..., gt=0)
-    details: Optional[dict] = None
-
-
-class SignalOut(BaseModel):
-    id: int
-    symbol: str
-    action: str
-    sl_pips: int
-    tp_pips: int
-    lot_size: float
-    details: Optional[dict]
-    created_at: datetime
+def signal_to_out(sig: TradeSignal) -> SignalOut:
+    return SignalOut(
+        id=sig.id,
+        symbol=sig.symbol,
+        action=sig.action,
+        sl_pips=sig.sl_pips,
+        tp_pips=sig.tp_pips,
+        lot_size=float(sig.lot_size) if sig.lot_size is not None else None,
+        details=sig.details,
+        created_at=(sig.created_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+                    if sig.created_at else datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")),
+    )
 
 
 # ---------------- Health ----------------
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
 
-# ---------------- /validate ----------------
-@app.post("/validate")
-def validate(payload: ValidateIn, db: Session = Depends(get_db)):
-    user = crud.get_user_by_email_and_token(
-        db, email=payload.email.strip().lower(), api_key=payload.api_key.strip()
+# ---------------- Validate (email + api_key) ----------------
+@app.post("/validate", response_model=ValidateResponse)
+def validate(req: ValidateRequest, db: Session = Depends(get_db)):
+    user = get_user_by_email_and_token(db, req.email.lower(), req.api_key)
+    if not user:
+        return ValidateResponse(ok=False, is_active=False, plan=None, daily_quota=None, expires_at=None)
+
+    # daily_quota None => unlimited
+    expires_at = None  # keep field for backward compat (you can compute if you have an expiry field)
+    return ValidateResponse(
+        ok=True,
+        is_active=bool(user.is_active),
+        plan=user.plan or "free",
+        daily_quota=user.daily_quota,
+        expires_at=expires_at,
     )
-    if not user or not user.is_active:
-        return {"ok": False, "is_active": False}
-
-    eff = crud.effective_plan_for_user(user)
-    return {
-        "ok": True,
-        "is_active": True,
-        "plan": eff["plan"],
-        "daily_quota": eff["daily_quota"],  # None => unlimited
-        "expires_at": (
-            user.expires_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-            if getattr(user, "expires_at", None)
-            else None
-        ),
-    }
 
 
-# ---------------- POST /signals (sender) ----------------
+# ---------------- Post a signal (sender) ----------------
 @app.post("/signals", response_model=SignalOut)
-def post_signal(payload: SignalIn, request: Request, db: Session = Depends(get_db)):
-    token = bearer_from_request(request)
-    sender = crud.get_user_by_token(db, api_key=token)
-    if not sender or not sender.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+def post_signal(
+    payload: SignalCreate,
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None, convert_underscores=False),
+):
+    token = bearer_token(authorization)
+    sender = get_user_by_token(db, token)
+    if not sender:
+        raise HTTPException(status_code=401, detail="Invalid API token")
 
-    # Normalize symbol here (avoid Pydantic validators for v2-compat)
-    sym = (payload.symbol or "").strip().upper()
+    action = (payload.action or "").lower()
+    if action not in {"buy", "sell", "adjust_sl", "adjust_tp", "close", "hold"}:
+        raise HTTPException(status_code=422, detail=f"Invalid action '{payload.action}'")
 
-    signal = crud.create_signal(
-        db,
-        user_id=sender.id,
-        symbol=sym,
-        action=payload.action,
-        sl_pips=payload.sl_pips,
-        tp_pips=payload.tp_pips,
-        lot_size=payload.lot_size,
-        details=payload.details or {},
-    )
-    return SignalOut(
-        id=signal.id,
-        symbol=signal.symbol,
-        action=signal.action,
-        sl_pips=signal.sl_pips,
-        tp_pips=signal.tp_pips,
-        lot_size=float(signal.lot_size),
-        details=signal.details,
-        created_at=signal.created_at.replace(tzinfo=timezone.utc),
-    )
+    ts = create_signal(db, sender, payload.dict())
+    db.commit()
+    return signal_to_out(ts)
 
 
-# ---------------- GET /signals (receiver; QUOTA PER TOKEN) ----------------
+# ---------------- Fetch signals (receiver, quota-respecting per token) ----------------
 @app.get("/signals", response_model=List[SignalOut])
-def get_signals(request: Request, response: Response, db: Session = Depends(get_db)):
-    token = bearer_from_request(request)
-    token_hash = sha256_hex(token)
+def get_signals(
+    response: Response,
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None, convert_underscores=False),
+):
+    token = bearer_token(authorization)
+    receiver = get_user_by_token(db, token)
+    if not receiver:
+        raise HTTPException(status_code=401, detail="Invalid API token")
 
-    receiver = crud.get_user_by_token(db, api_key=token)
-    if not receiver or not receiver.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    signals, used, remaining = fetch_signals_for_receiver_with_quota(db, receiver, token, limit=limit)
+    db.commit()  # persist any read markers
 
-    eff = crud.effective_plan_for_user(receiver)  # {"plan":..., "daily_quota": int|None}
-    plan = eff["plan"]
-    quota = eff["daily_quota"]  # None => unlimited
+    # Set helpful headers
+    response.headers["X-Plan"] = (receiver.plan or "free")
+    response.headers["X-Daily-Quota"] = str(receiver.daily_quota) if receiver.daily_quota is not None else "unlimited"
+    response.headers["X-Used-Today"] = str(used)
+    response.headers["X-Remaining"] = str(remaining) if remaining is not None else "unlimited"
 
-    opens_today = crud.count_actionables_today_for_token(db, token_hash=token_hash)
-
-    rows = crud.list_latest_signals_for_receiver(db, receiver_id=receiver.id)
-
-    deliver: List[SignalOut] = []
-    remaining = None if quota is None else max(quota - opens_today, 0)
-
-    for r in rows:
-        is_actionable = r["action"] in ("buy", "sell")
-
-        if is_actionable:
-            if remaining is None:
-                # unlimited plan
-                crud.track_signal_read(db, token_hash=token_hash, signal_id=r["id"])
-                deliver.append(SignalOut(**r))
-            elif remaining > 0:
-                inserted = crud.track_signal_read(db, token_hash=token_hash, signal_id=r["id"])
-                if inserted:
-                    remaining -= 1
-                deliver.append(SignalOut(**r))
-            else:
-                # quota exhausted => skip actionable
-                continue
-        else:
-            # non-actionables always included and not counted
-            deliver.append(SignalOut(**r))
-
-    # Refresh for headers
-    new_opens = crud.count_actionables_today_for_token(db, token_hash=token_hash)
-
-    response.headers["X-Plan"] = plan
-    response.headers["X-Daily-Quota"] = "unlimited" if quota is None else str(quota)
-    response.headers["X-Opens-Today"] = str(new_opens)
-    response.headers["X-Remaining"] = (
-        "unlimited" if quota is None else str(max(quota - new_opens, 0))
-    )
-
-    return deliver
+    return [signal_to_out(s) for s in signals]
