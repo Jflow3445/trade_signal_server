@@ -54,7 +54,7 @@ class ValidateIn(BaseModel):
 
 class SignalIn(BaseModel):
     symbol: str = Field(..., min_length=3, max_length=32)
-    action: str = Field(..., regex=r"^(buy|sell|adjust_sl|adjust_tp|close|hold)$")
+    action: str = Field(..., pattern=r"^(buy|sell|adjust_sl|adjust_tp|close|hold)$")
     sl_pips: int = Field(..., ge=1)
     tp_pips: int = Field(..., ge=1)
     lot_size: float = Field(..., gt=0)

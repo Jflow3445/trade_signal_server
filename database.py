@@ -3,7 +3,7 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql+psycopg2:///tradesignals")
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./trade_signals.db")
 
 # Pre-ping so dead connections are recycled
 engine = create_engine(

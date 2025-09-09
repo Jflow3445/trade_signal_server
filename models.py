@@ -17,6 +17,8 @@ class User(Base):
     api_key     = Column(String, nullable=False, unique=True, index=True)
     is_active   = Column(Boolean, nullable=False, default=True)
     expires_at  = Column(DateTime(timezone=True), nullable=True)
+    plan        = Column(String, nullable=True, default="free")
+    daily_quota = Column(Integer, nullable=True)  # None means use plan default
 
     # relationships (not strictly required for queries)
     signals     = relationship("TradeSignal", back_populates="user", lazy="selectin")
@@ -63,15 +65,15 @@ Index("idx_subscriptions_sender",   Subscription.sender_id)
 
 class SignalRead(Base):
     """
-    Ledger of which receiver has been delivered which signal (consumes quota for buy/sell).
+    Ledger of which token has been delivered which signal (consumes quota for buy/sell).
     """
     __tablename__ = "signal_reads"
 
-    id        = Column(Integer, primary_key=True)
-    user_id   = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    signal_id = Column(Integer, ForeignKey("trade_signals.id", ondelete="CASCADE"), nullable=False, index=True)
-    read_at   = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    id         = Column(Integer, primary_key=True)
+    token_hash = Column(String, nullable=False, index=True)
+    signal_id  = Column(Integer, ForeignKey("trade_signals.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
 
     __table_args__ = (
-        UniqueConstraint("user_id", "signal_id", name="uq_signal_reads_user_signal"),
+        UniqueConstraint("token_hash", "signal_id", name="uq_signal_reads_token_signal"),
     )
