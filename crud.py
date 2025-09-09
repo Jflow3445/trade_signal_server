@@ -7,55 +7,35 @@ from sqlalchemy.orm import Session
 from models import User, TradeSignal
 
 
-# ------------------------------------------------------------
-# Users
-# ------------------------------------------------------------
+# -------- Users --------
 def get_user_by_email_and_token(db: Session, email: str, api_key: str) -> Optional[User]:
-    return (
-        db.query(User)
-        .filter(User.email == email, User.api_key == api_key)
-        .first()
-    )
+    return db.query(User).filter(User.email == email, User.api_key == api_key).first()
 
 
 def get_user_by_token(db: Session, api_key: str) -> Optional[User]:
-    return (
-        db.query(User)
-        .filter(User.api_key == api_key)
-        .first()
-    )
+    return db.query(User).filter(User.api_key == api_key).first()
 
 
-# ------------------------------------------------------------
-# Plan / quota (effective)
-#   - If users.daily_quota is set, it overrides plan default
-#   - Defaults: free=1, silver=3, gold=None (unlimited)
-# ------------------------------------------------------------
+# -------- Plans / Quotas --------
 def plan_default_quota(plan: Optional[str]) -> Optional[int]:
-    plan = (plan or "free").lower()
-    if plan == "free":
+    p = (plan or "free").lower()
+    if p == "free":
         return 1
-    if plan == "silver":
+    if p == "silver":
         return 3
-    if plan == "gold":
-        return None
-    # Unknown plans fall back to free
-    return 1
+    if p == "gold":
+        return None  # unlimited
+    return 1  # fallback
 
 
 def effective_plan_for_user(user: User) -> Dict[str, Optional[int]]:
-    plan = (user.plan or "free").lower()
-    # explicit per-user daily_quota overrides the plan default (including None for unlimited)
-    if user.daily_quota is None:
-        quota = plan_default_quota(plan)
-    else:
-        quota = user.daily_quota
-    return {"plan": plan, "daily_quota": quota}
+    p = (user.plan or "free").lower()
+    # Explicit per-user daily_quota overrides plan default (including None for unlimited)
+    q = plan_default_quota(p) if user.daily_quota is None else user.daily_quota
+    return {"plan": p, "daily_quota": q}
 
 
-# ------------------------------------------------------------
-# Signals (sender creates)
-# ------------------------------------------------------------
+# -------- Signals (sender creates) --------
 def create_signal(
     db: Session,
     user_id: int,
@@ -82,13 +62,8 @@ def create_signal(
     return s
 
 
-# ------------------------------------------------------------
-# Signals feed for a receiver (join subscriptions)
-# Returns list of dicts for easy pydantic casting in main
-# ------------------------------------------------------------
+# -------- Feed for a receiver --------
 def list_latest_signals_for_receiver(db: Session, receiver_id: int) -> List[dict]:
-    # We return the entire stream (client filters by last-id).
-    # Adjust ORDER BY as needed; here ascending by id to keep original execution order.
     sql = text(
         """
         SELECT ts.id,
@@ -106,31 +81,29 @@ def list_latest_signals_for_receiver(db: Session, receiver_id: int) -> List[dict
         """
     )
     rows = db.execute(sql, {"rid": receiver_id}).mappings().all()
-    # Force JSON-able Python types
-    return [
-        {
-            "id": int(r["id"]),
-            "symbol": str(r["symbol"]),
-            "action": str(r["action"]),
-            "sl_pips": int(r["sl_pips"]),
-            "tp_pips": int(r["tp_pips"]),
-            "lot_size": float(r["lot_size"]),
-            "details": r["details"] if isinstance(r["details"], dict) else None,
-            "created_at": r["created_at"],
-        }
-        for r in rows
-    ]
+    out: List[dict] = []
+    for r in rows:
+        out.append(
+            {
+                "id": int(r["id"]),
+                "symbol": str(r["symbol"]),
+                "action": str(r["action"]),
+                "sl_pips": int(r["sl_pips"]),
+                "tp_pips": int(r["tp_pips"]),
+                "lot_size": float(r["lot_size"]),
+                "details": r["details"] if isinstance(r["details"], dict) else None,
+                "created_at": r["created_at"],
+            }
+        )
+    return out
 
 
-# ------------------------------------------------------------
-# Delivery accounting: per-token, per-day, actionable-only
-#   - signal_reads(token_hash, signal_id, created_at)
-#   - Unique index on (token_hash, signal_id) avoids double-count
-# ------------------------------------------------------------
+# -------- Delivery accounting (per-token) --------
 def track_signal_read(db: Session, token_hash: str, signal_id: int) -> bool:
     """
-    Insert a delivery record if not exists.
+    Insert a (token, signal) delivery record.
     Returns True if a new row was inserted, False if it already existed.
+    Requires UNIQUE INDEX on (token_hash, signal_id).
     """
     sql = text(
         """
@@ -141,15 +114,13 @@ def track_signal_read(db: Session, token_hash: str, signal_id: int) -> bool:
     )
     res = db.execute(sql, {"th": token_hash, "sid": signal_id})
     db.commit()
-    # SQLAlchemy's rowcount is unreliable on PostgreSQL for ON CONFLICT DO NOTHING,
-    # but it is 1 when inserted and 0 when skipped in recent versions.
+    # rowcount is 1 on insert, 0 on conflict (Postgres + SQLAlchemy recent versions)
     return bool(getattr(res, "rowcount", 0))
 
 
 def count_actionables_today_for_token(db: Session, token_hash: str) -> int:
     """
-    Count how many actionable (buy/sell) deliveries this token has for the current UTC day.
-    Uses sr.created_at if present; otherwise falls back to ts.created_at.
+    Count actionable (buy/sell) deliveries for this token on current UTC date.
     """
     sql = text(
         """

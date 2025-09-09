@@ -1,11 +1,10 @@
 import hashlib
-import json
 from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import FastAPI, Depends, Request, Response, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
@@ -14,7 +13,7 @@ import crud
 
 app = FastAPI(title="Trade Signal Server", version="1.0.0")
 
-# CORS (adjust as you wish)
+# CORS (adjust as needed)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,9 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------------------------------------------------------
-# DB dependency
-# -------------------------------------------------------------------
+# ---------------- DB dependency ----------------
 def get_db():
     db = SessionLocal()
     try:
@@ -33,9 +30,7 @@ def get_db():
         db.close()
 
 
-# -------------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------------
+# ---------------- Helpers ----------------
 def bearer_from_request(request: Request) -> str:
     auth = request.headers.get("Authorization", "")
     if not auth.lower().startswith("bearer "):
@@ -47,12 +42,11 @@ def bearer_from_request(request: Request) -> str:
 
 
 def sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+    import hashlib as _h
+    return _h.sha256(s.encode("utf-8")).hexdigest()
 
 
-# -------------------------------------------------------------------
-# Schemas
-# -------------------------------------------------------------------
+# ---------------- Schemas ----------------
 class ValidateIn(BaseModel):
     email: str
     api_key: str
@@ -66,10 +60,6 @@ class SignalIn(BaseModel):
     lot_size: float = Field(..., gt=0)
     details: Optional[dict] = None
 
-    @validator("symbol")
-    def norm_symbol(cls, v: str) -> str:
-        return v.strip().upper()
-
 
 class SignalOut(BaseModel):
     id: int
@@ -82,17 +72,20 @@ class SignalOut(BaseModel):
     created_at: datetime
 
 
-# -------------------------------------------------------------------
-# /validate  (email + api_key)
-# -------------------------------------------------------------------
+# ---------------- Health ----------------
+@app.get("/health")
+def health():
+    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+
+
+# ---------------- /validate ----------------
 @app.post("/validate")
 def validate(payload: ValidateIn, db: Session = Depends(get_db)):
-    user = crud.get_user_by_email_and_token(db, email=payload.email.strip().lower(), api_key=payload.api_key.strip())
+    user = crud.get_user_by_email_and_token(
+        db, email=payload.email.strip().lower(), api_key=payload.api_key.strip()
+    )
     if not user or not user.is_active:
-        return {
-            "ok": False,
-            "is_active": False,
-        }
+        return {"ok": False, "is_active": False}
 
     eff = crud.effective_plan_for_user(user)
     return {
@@ -100,14 +93,15 @@ def validate(payload: ValidateIn, db: Session = Depends(get_db)):
         "is_active": True,
         "plan": eff["plan"],
         "daily_quota": eff["daily_quota"],  # None => unlimited
-        "expires_at": (user.expires_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-                       if getattr(user, "expires_at", None) else None),
+        "expires_at": (
+            user.expires_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            if getattr(user, "expires_at", None)
+            else None
+        ),
     }
 
 
-# -------------------------------------------------------------------
-# POST /signals  (sender posts a signal)
-# -------------------------------------------------------------------
+# ---------------- POST /signals (sender) ----------------
 @app.post("/signals", response_model=SignalOut)
 def post_signal(payload: SignalIn, request: Request, db: Session = Depends(get_db)):
     token = bearer_from_request(request)
@@ -115,10 +109,13 @@ def post_signal(payload: SignalIn, request: Request, db: Session = Depends(get_d
     if not sender or not sender.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
+    # Normalize symbol here (avoid Pydantic validators for v2-compat)
+    sym = (payload.symbol or "").strip().upper()
+
     signal = crud.create_signal(
         db,
         user_id=sender.id,
-        symbol=payload.symbol,
+        symbol=sym,
         action=payload.action,
         sl_pips=payload.sl_pips,
         tp_pips=payload.tp_pips,
@@ -137,9 +134,7 @@ def post_signal(payload: SignalIn, request: Request, db: Session = Depends(get_d
     )
 
 
-# -------------------------------------------------------------------
-# GET /signals  (receiver pulls feed; QUOTA ENFORCED PER TOKEN)
-# -------------------------------------------------------------------
+# ---------------- GET /signals (receiver; QUOTA PER TOKEN) ----------------
 @app.get("/signals", response_model=List[SignalOut])
 def get_signals(request: Request, response: Response, db: Session = Depends(get_db)):
     token = bearer_from_request(request)
@@ -149,49 +144,45 @@ def get_signals(request: Request, response: Response, db: Session = Depends(get_
     if not receiver or not receiver.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-    # Plan/quota
-    eff = crud.effective_plan_for_user(receiver)  # {'plan': 'free'|'silver'|'gold', 'daily_quota': int|None}
+    eff = crud.effective_plan_for_user(receiver)  # {"plan":..., "daily_quota": int|None}
     plan = eff["plan"]
     quota = eff["daily_quota"]  # None => unlimited
 
-    # How many actionable (buy/sell) we have already delivered TODAY to THIS token
     opens_today = crud.count_actionables_today_for_token(db, token_hash=token_hash)
 
-    # Build feed (all signals the receiver is entitled to, based on subscriptions)
-    all_feed = crud.list_latest_signals_for_receiver(db, receiver_id=receiver.id)
+    rows = crud.list_latest_signals_for_receiver(db, receiver_id=receiver.id)
 
     deliver: List[SignalOut] = []
-    actionable_remaining: Optional[int] = None if quota is None else max(quota - opens_today, 0)
+    remaining = None if quota is None else max(quota - opens_today, 0)
 
-    for row in all_feed:
-        is_actionable = row["action"] in ("buy", "sell")
+    for r in rows:
+        is_actionable = r["action"] in ("buy", "sell")
 
         if is_actionable:
-            if actionable_remaining is None:
+            if remaining is None:
                 # unlimited plan
-                seen = crud.track_signal_read(db, token_hash=token_hash, signal_id=row["id"])
-                if seen:  # if it was a new delivery record, we could count it; but for headers we already expose opens_today
-                    pass
-                deliver.append(SignalOut(**row))
-            elif actionable_remaining > 0:
-                seen = crud.track_signal_read(db, token_hash=token_hash, signal_id=row["id"])
-                if seen:
-                    actionable_remaining -= 1  # only decrement when we actually mark a new delivery
-                deliver.append(SignalOut(**row))
+                crud.track_signal_read(db, token_hash=token_hash, signal_id=r["id"])
+                deliver.append(SignalOut(**r))
+            elif remaining > 0:
+                inserted = crud.track_signal_read(db, token_hash=token_hash, signal_id=r["id"])
+                if inserted:
+                    remaining -= 1
+                deliver.append(SignalOut(**r))
             else:
-                # Quota exhausted: SKIP actionable
+                # quota exhausted => skip actionable
                 continue
         else:
-            # Non-actionables (adjust_sl/adjust_tp/close/hold) are not counted; always deliver
-            deliver.append(SignalOut(**row))
+            # non-actionables always included and not counted
+            deliver.append(SignalOut(**r))
 
-    # Recompute effective opens-today if we decremented (for headers)
-    new_opens_today = crud.count_actionables_today_for_token(db, token_hash=token_hash)
+    # Refresh for headers
+    new_opens = crud.count_actionables_today_for_token(db, token_hash=token_hash)
 
-    # Debug headers
     response.headers["X-Plan"] = plan
     response.headers["X-Daily-Quota"] = "unlimited" if quota is None else str(quota)
-    response.headers["X-Opens-Today"] = str(new_opens_today)
-    response.headers["X-Remaining"] = "unlimited" if quota is None else str(max(quota - new_opens_today, 0))
+    response.headers["X-Opens-Today"] = str(new_opens)
+    response.headers["X-Remaining"] = (
+        "unlimited" if quota is None else str(max(quota - new_opens, 0))
+    )
 
     return deliver
