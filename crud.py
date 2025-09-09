@@ -51,12 +51,18 @@ def issue_or_update_user(
         raise ValueError("reserved_username")
 
     token = secrets.token_hex(32)
+    # Determine the daily quota: override if provided, otherwise use plan default
+    if daily_quota_override is not None:
+        quota = daily_quota_override
+    else:
+        quota = plan_defaults(plan).get("daily_quota")
+    
     user = db.query(User).filter(User.username == username).one_or_none()
     if user:
         user.email = email or user.email
         user.plan = plan
         user.api_key = token
-        user.daily_quota = daily_quota_override
+        user.daily_quota = quota
         if months_valid:
             user.expires_at = now() + timedelta(days=30*months_valid)
         user.is_active = True
@@ -66,7 +72,7 @@ def issue_or_update_user(
             username=username,
             api_key=token,
             plan=plan,
-            daily_quota=daily_quota_override,
+            daily_quota=quota,
             expires_at=(now() + timedelta(days=30*months_valid)) if months_valid else None,
             is_active=True,
         )
