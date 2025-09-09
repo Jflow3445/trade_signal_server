@@ -167,26 +167,28 @@ def get_signals(
     quota = eff["daily_quota"]  # None means unlimited
     
     if quota is None:
-        # Unlimited users get all available signals
-        rows = crud.list_signals(db, sender.id, limit=limit)
+        # Unlimited users get all available fresh signals (max 1 minute old)
+        rows = crud.list_signals(db, sender.id, limit=limit, max_age_minutes=1)
         if resp:
             resp.headers["X-Quota-Limit"] = "unlimited"
             resp.headers["X-Quota-Remaining"] = "unlimited"
         return rows
 
-    # For limited users, check and consume quota
+    # For limited users, check quota first
     granted = crud.check_and_consume_quota(db, user.id, limit, quota)
     
     if granted == 0:
         # Quota exhausted
-        consumed_today = crud.get_daily_consumption(db, user.id)
         if resp:
             resp.headers["X-Quota-Limit"] = str(quota)
             resp.headers["X-Quota-Remaining"] = "0"
         raise HTTPException(status_code=429, detail="daily_quota_exhausted")
     
-    # Retrieve the granted number of signals
-    rows = crud.list_signals(db, sender.id, limit=granted)
+    # Retrieve fresh signals (max 1 minute old)
+    rows = crud.list_signals(db, sender.id, limit=granted, max_age_minutes=1)
+    
+    # Only consume quota for signals actually returned
+    crud.consume_quota_for_signals(db, user.id, len(rows))
     
     if resp:
         consumed_after = crud.get_daily_consumption(db, user.id)
@@ -215,14 +217,14 @@ def get_latest(
     quota = eff["daily_quota"]
     
     if quota is None:
-        # Unlimited users get all available signals
-        rows = crud.list_latest_signals(db, sender.id, limit=limit)
+        # Unlimited users get all available fresh signals (max 1 minute old)
+        rows = crud.list_latest_signals(db, sender.id, limit=limit, max_age_minutes=1)
         if resp:
             resp.headers["X-Quota-Limit"] = "unlimited"
             resp.headers["X-Quota-Remaining"] = "unlimited"
         return rows
 
-    # For limited users, check and consume quota
+    # For limited users, check quota first
     granted = crud.check_and_consume_quota(db, user.id, limit, quota)
     
     if granted == 0:
@@ -232,8 +234,11 @@ def get_latest(
             resp.headers["X-Quota-Remaining"] = "0"
         raise HTTPException(status_code=429, detail="daily_quota_exhausted")
     
-    # Retrieve the granted number of signals
-    rows = crud.list_latest_signals(db, sender.id, limit=granted)
+    # Retrieve fresh latest signals (max 1 minute old)
+    rows = crud.list_latest_signals(db, sender.id, limit=granted, max_age_minutes=1)
+    
+    # Only consume quota for signals actually returned
+    crud.consume_quota_for_signals(db, user.id, len(rows))
     
     if resp:
         consumed_after = crud.get_daily_consumption(db, user.id)

@@ -140,15 +140,19 @@ def create_signal(db: Session, user_id: int, s: TradeSignalCreate) -> TradeSigna
     db.refresh(sig)
     return sig
 
-def list_signals(db: Session, user_id: int, limit: int = 100):
+def list_signals(db: Session, user_id: int, limit: int = 100, max_age_minutes: int = 1):
+    cutoff_time = now() - timedelta(minutes=max_age_minutes)
     return (db.query(TradeSignal)
-              .filter(TradeSignal.user_id == user_id)
+              .filter(TradeSignal.user_id == user_id,
+                      TradeSignal.created_at >= cutoff_time)
               .order_by(TradeSignal.created_at.desc())
               .limit(limit).all())
 
-def list_latest_signals(db: Session, user_id: int, limit: int = 50):
+def list_latest_signals(db: Session, user_id: int, limit: int = 50, max_age_minutes: int = 1):
+    cutoff_time = now() - timedelta(minutes=max_age_minutes)
     return (db.query(LatestSignal)
-              .filter(LatestSignal.user_id == user_id)
+              .filter(LatestSignal.user_id == user_id,
+                      LatestSignal.updated_at >= cutoff_time)
               .order_by(LatestSignal.updated_at.desc())
               .limit(limit).all())
 
@@ -216,14 +220,14 @@ def check_and_consume_quota(db: Session, user_id: int, requested: int, daily_quo
     if remaining == 0:
         return 0
     
-    # Grant up to remaining quota
+    # Grant up to remaining quota (don't consume yet - wait for actual signals returned)
     granted = min(requested, remaining)
-    
-    # Record the consumption
-    if granted > 0:
-        record_signal_consumption(db, user_id, granted)
-    
     return granted
+
+def consume_quota_for_signals(db: Session, user_id: int, actual_signals_returned: int) -> None:
+    """Record consumption for signals that were actually returned to user"""
+    if actual_signals_returned > 0:
+        record_signal_consumption(db, user_id, actual_signals_returned)
 
 # ---------- EA activations / positions ----------
 def touch_activation(db: Session, user_id: int, account_id: str, broker_server: str, hwid: Optional[str]) -> Activation:
