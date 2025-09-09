@@ -167,9 +167,39 @@ def get_signals(
     if not sender:
         raise HTTPException(status_code=500, detail=f"Sender user '{SENDER_USERNAME}' not found")
     
-    # Get fresh signals from sender
-    rows = crud.list_signals(db, sender.id, limit=limit, max_age_minutes=max_age_minutes)
-    return rows
+    # Apply user's daily quota limit
+    eff = _effective_plan_and_quota(db, user)
+    quota = eff["daily_quota"]  # None means unlimited
+    
+    if quota is None:
+        # Unlimited users get all available signals
+        rows = crud.list_signals(db, sender.id, limit=limit, max_age_minutes=max_age_minutes)
+        return rows
+    
+    # For limited users, check daily consumption
+    try:
+        consumed_today = crud.get_daily_consumption(db, user.id)
+        remaining = max(quota - consumed_today, 0)
+        
+        if remaining == 0:
+            # Daily quota exhausted
+            raise HTTPException(status_code=429, detail="Daily quota exhausted")
+        
+        # Grant up to remaining quota
+        granted = min(limit, remaining)
+        rows = crud.list_signals(db, sender.id, limit=granted, max_age_minutes=max_age_minutes)
+        
+        # Record consumption for signals actually returned
+        if len(rows) > 0:
+            crud.consume_quota_for_signals(db, user.id, len(rows))
+        
+        return rows
+    except Exception as e:
+        # If consumption tracking fails, fall back to simple per-request limit
+        # This ensures the system works even if the daily_consumption table doesn't exist
+        limit = min(limit, quota)
+        rows = crud.list_signals(db, sender.id, limit=limit, max_age_minutes=max_age_minutes)
+        return rows
 
 @app.get("/signals/latest", response_model=List[LatestSignalOut])
 def get_latest(
@@ -191,9 +221,39 @@ def get_latest(
     if not sender:
         raise HTTPException(status_code=500, detail=f"Sender user '{SENDER_USERNAME}' not found")
     
-    # Get fresh latest signals from sender
-    rows = crud.list_latest_signals(db, sender.id, limit=limit, max_age_minutes=max_age_minutes)
-    return rows
+    # Apply user's daily quota limit
+    eff = _effective_plan_and_quota(db, user)
+    quota = eff["daily_quota"]  # None means unlimited
+    
+    if quota is None:
+        # Unlimited users get all available signals
+        rows = crud.list_latest_signals(db, sender.id, limit=limit, max_age_minutes=max_age_minutes)
+        return rows
+    
+    # For limited users, check daily consumption
+    try:
+        consumed_today = crud.get_daily_consumption(db, user.id)
+        remaining = max(quota - consumed_today, 0)
+        
+        if remaining == 0:
+            # Daily quota exhausted
+            raise HTTPException(status_code=429, detail="Daily quota exhausted")
+        
+        # Grant up to remaining quota
+        granted = min(limit, remaining)
+        rows = crud.list_latest_signals(db, sender.id, limit=granted, max_age_minutes=max_age_minutes)
+        
+        # Record consumption for signals actually returned
+        if len(rows) > 0:
+            crud.consume_quota_for_signals(db, user.id, len(rows))
+        
+        return rows
+    except Exception as e:
+        # If consumption tracking fails, fall back to simple per-request limit
+        # This ensures the system works even if the daily_consumption table doesn't exist
+        limit = min(limit, quota)
+        rows = crud.list_latest_signals(db, sender.id, limit=limit, max_age_minutes=max_age_minutes)
+        return rows
 
 # ---- Trades ----
 @app.post("/trades", response_model=TradeRecordOut)
