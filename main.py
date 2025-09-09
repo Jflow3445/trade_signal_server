@@ -142,14 +142,8 @@ def post_signal(
     if payload.action not in ACTIONABLE:
         raise HTTPException(status_code=400, detail="Unsupported action")
 
-    # Check sender's quota for signal creation
-    eff = _effective_plan_and_quota(db, user)
-    quota = eff["daily_quota"]
-    if quota is not None:  # None means unlimited
-        used = crud.count_signals_created_today(db, user.id)
-        if used >= quota:
-            raise HTTPException(status_code=429, detail="daily_signal_creation_quota_exhausted")
-
+    # Publishing is unlimited for the designated sender
+    # Quotas only apply to recipients on GET requests
     sig = crud.create_signal(db, user_id=user.id, s=payload)
     return sig
 
