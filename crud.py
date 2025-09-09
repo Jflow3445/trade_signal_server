@@ -1,243 +1,166 @@
-# crud.py
-from __future__ import annotations
-from typing import Optional, List, Tuple, Iterable
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
+from sqlalchemy import text
 from sqlalchemy.orm import Session
-from sqlalchemy import select, func, and_, or_, literal, text
-from models import User, TradeSignal, Subscription, SignalRead
+
+from models import User, TradeSignal
 
 
-# ---------- helpers ----------
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def today_utc() -> date:
-    return now_utc().date()
-
-
-# ---------- users ----------
-def get_user_by_api_key(db: Session, api_key: str) -> Optional[User]:
-    return db.execute(
-        select(User).where(User.api_key == api_key)
-    ).scalar_one_or_none()
-
-
-def get_user_by_email(db: Session, email: str) -> Optional[User]:
-    return db.execute(
-        select(User).where(func.lower(User.email) == func.lower(literal(email)))
-    ).scalar_one_or_none()
-
-
-def validate_user(db: Session, email: str, api_key: str) -> Tuple[bool, Optional[User]]:
-    """
-    Validate by email + api_key, but **return ok=False instead of raising**.
-    EA expects 200 with "ok":true/false.
-    """
-    user = get_user_by_api_key(db, api_key)
-    if not user:
-        return False, None
-    if email and user.email and email.lower() != user.email.lower():
-        # api_key belongs to a different email
-        return False, None
-    if not user.is_active:
-        return False, user
-    if user.expires_at and user.expires_at <= now_utc():
-        # expired
-        return False, user
-    return True, user
-
-
-# ---------- plan & quota (per API KEY) ----------
-def plan_for_user(user: User) -> Tuple[str, Optional[int]]:
-    """
-    Map user to (plan_name, daily_quota).
-    If you already store plan elsewhere, adjust this mapping.
-    """
-    # Heuristic: derive from user's recent /validate examples
-    # If you store plan in another table, look it up here.
-    name = "free"
-    daily = 1
-
-    # Examples seen: free=1, silver=3, gold=unlimited
-    # We can infer by looking at expires_at presence or username/email patterns,
-    # but it's better to store plan in your DB. Here we keep a simple override:
-    # (Adjust this logic if you already persist a "plan")
-    uname = (user.username or "").lower()
-    mail = (user.email or "").lower()
-
-    if uname in {"jflow3445", "adzikakafui123", "felix"} or "admin@" in mail:
-        name, daily = "gold", None
-    elif uname in {"alice", "tarkan"}:
-        name, daily = "silver", 3
-    else:
-        name, daily = "free", 1
-
-    return name, daily
-
-
-def remaining_quota_for_api_key(db: Session, api_key: str) -> Tuple[Optional[int], str]:
-    """
-    Return (remaining, plan_name) for today UTC.
-    None remaining means unlimited.
-    """
-    user = get_user_by_api_key(db, api_key)
-    if not user:
-        return 0, "unknown"
-
-    plan_name, daily_quota = plan_for_user(user)
-
-    if not daily_quota:  # None or 0 -> unlimited
-        return None, plan_name
-
-    # count buy/sell reads today
-    start = datetime.combine(today_utc(), datetime.min.time(), tzinfo=timezone.utc)
-    end   = datetime.combine(today_utc(), datetime.max.time(), tzinfo=timezone.utc)
-
-    q = (
-        select(func.count(SignalRead.id))
-        .join(TradeSignal, TradeSignal.id == SignalRead.signal_id)
-        .where(
-            SignalRead.user_id == user.id,
-            SignalRead.read_at >= start,
-            SignalRead.read_at <= end,
-            TradeSignal.action.in_(("buy", "sell")),
-        )
+# ------------------------------------------------------------
+# Users
+# ------------------------------------------------------------
+def get_user_by_email_and_token(db: Session, email: str, api_key: str) -> Optional[User]:
+    return (
+        db.query(User)
+        .filter(User.email == email, User.api_key == api_key)
+        .first()
     )
-    used = db.execute(q).scalar_one()
-    remaining = max(0, daily_quota - int(used or 0))
-    return remaining, plan_name
 
 
-# ---------- subscriptions ----------
-def list_subscriptions(db: Session, receiver_id: int) -> List[int]:
-    """
-    Return list of sender user_ids whom 'receiver_id' is allowed to receive.
-    """
-    rows = db.execute(
-        select(Subscription.sender_id).where(Subscription.receiver_id == receiver_id)
-    ).all()
-    return [sid for (sid,) in rows]
+def get_user_by_token(db: Session, api_key: str) -> Optional[User]:
+    return (
+        db.query(User)
+        .filter(User.api_key == api_key)
+        .first()
+    )
 
 
-# ---------- signals (create & list) ----------
-def create_trade_signal(
+# ------------------------------------------------------------
+# Plan / quota (effective)
+#   - If users.daily_quota is set, it overrides plan default
+#   - Defaults: free=1, silver=3, gold=None (unlimited)
+# ------------------------------------------------------------
+def plan_default_quota(plan: Optional[str]) -> Optional[int]:
+    plan = (plan or "free").lower()
+    if plan == "free":
+        return 1
+    if plan == "silver":
+        return 3
+    if plan == "gold":
+        return None
+    # Unknown plans fall back to free
+    return 1
+
+
+def effective_plan_for_user(user: User) -> Dict[str, Optional[int]]:
+    plan = (user.plan or "free").lower()
+    # explicit per-user daily_quota overrides the plan default (including None for unlimited)
+    if user.daily_quota is None:
+        quota = plan_default_quota(plan)
+    else:
+        quota = user.daily_quota
+    return {"plan": plan, "daily_quota": quota}
+
+
+# ------------------------------------------------------------
+# Signals (sender creates)
+# ------------------------------------------------------------
+def create_signal(
     db: Session,
     user_id: int,
     symbol: str,
     action: str,
-    sl_pips: Optional[int],
-    tp_pips: Optional[int],
-    lot_size: Optional[float],
-    details,
+    sl_pips: int,
+    tp_pips: int,
+    lot_size: float,
+    details: dict,
 ) -> TradeSignal:
-    sig = TradeSignal(
+    s = TradeSignal(
         user_id=user_id,
         symbol=symbol,
         action=action,
-        sl_pips=sl_pips or 0,
-        tp_pips=tp_pips or 0,
-        lot_size=lot_size or 0.0,
-        details=details,
-        created_at=now_utc(),
+        sl_pips=sl_pips,
+        tp_pips=tp_pips,
+        lot_size=lot_size,
+        details=details or {},
+        created_at=datetime.now(timezone.utc),
     )
-    db.add(sig)
+    db.add(s)
     db.commit()
-    db.refresh(sig)
-    return sig
+    db.refresh(s)
+    return s
 
 
-def _unread_signals_for_receiver(db: Session, receiver: User, sender_ids: List[int], limit: int = 200) -> List[TradeSignal]:
-    """
-    Fetch latest signals from allowed senders that this receiver hasn't been delivered yet.
-    We return a bit more than we might deliver (we'll slice by quota later).
-    """
-    if not sender_ids:
-        return []
-
-    q = (
-        select(TradeSignal)
-        .where(TradeSignal.user_id.in_(sender_ids))
-        .where(~TradeSignal.id.in_(
-            select(SignalRead.signal_id).where(SignalRead.user_id == receiver.id)
-        ))
-        .order_by(TradeSignal.id.asc())
-        .limit(limit)
+# ------------------------------------------------------------
+# Signals feed for a receiver (join subscriptions)
+# Returns list of dicts for easy pydantic casting in main
+# ------------------------------------------------------------
+def list_latest_signals_for_receiver(db: Session, receiver_id: int) -> List[dict]:
+    # We return the entire stream (client filters by last-id).
+    # Adjust ORDER BY as needed; here ascending by id to keep original execution order.
+    sql = text(
+        """
+        SELECT ts.id,
+               ts.symbol,
+               ts.action,
+               ts.sl_pips,
+               ts.tp_pips,
+               ts.lot_size,
+               ts.details,
+               ts.created_at
+        FROM trade_signals ts
+        JOIN subscriptions sub ON sub.sender_id = ts.user_id
+        WHERE sub.receiver_id = :rid
+        ORDER BY ts.id ASC
+        """
     )
-    return [row[0] for row in db.execute(q).all()]
+    rows = db.execute(sql, {"rid": receiver_id}).mappings().all()
+    # Force JSON-able Python types
+    return [
+        {
+            "id": int(r["id"]),
+            "symbol": str(r["symbol"]),
+            "action": str(r["action"]),
+            "sl_pips": int(r["sl_pips"]),
+            "tp_pips": int(r["tp_pips"]),
+            "lot_size": float(r["lot_size"]),
+            "details": r["details"] if isinstance(r["details"], dict) else None,
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
 
 
-def record_signal_reads(db: Session, user_id: int, signal_ids: Iterable[int]) -> None:
-    """Insert rows into signal_reads with ON CONFLICT DO NOTHING semantics."""
-    if not signal_ids:
-        return
-    values = [{"user_id": user_id, "signal_id": sid, "read_at": now_utc()} for sid in signal_ids]
-    # Bulk insert with conflict ignore (SQLAlchemy Core upsert)
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-    stmt = pg_insert(SignalRead).values(values)
-    stmt = stmt.on_conflict_do_nothing(index_elements=["user_id", "signal_id"])
-    db.execute(stmt)
+# ------------------------------------------------------------
+# Delivery accounting: per-token, per-day, actionable-only
+#   - signal_reads(token_hash, signal_id, created_at)
+#   - Unique index on (token_hash, signal_id) avoids double-count
+# ------------------------------------------------------------
+def track_signal_read(db: Session, token_hash: str, signal_id: int) -> bool:
+    """
+    Insert a delivery record if not exists.
+    Returns True if a new row was inserted, False if it already existed.
+    """
+    sql = text(
+        """
+        INSERT INTO signal_reads (token_hash, signal_id, created_at)
+        VALUES (:th, :sid, NOW() AT TIME ZONE 'UTC')
+        ON CONFLICT (token_hash, signal_id) DO NOTHING
+        """
+    )
+    res = db.execute(sql, {"th": token_hash, "sid": signal_id})
     db.commit()
+    # SQLAlchemy's rowcount is unreliable on PostgreSQL for ON CONFLICT DO NOTHING,
+    # but it is 1 when inserted and 0 when skipped in recent versions.
+    return bool(getattr(res, "rowcount", 0))
 
 
-def list_signals_for_receiver(
-    db: Session,
-    receiver: User,
-    api_key: str,
-    max_fetch: int = 200
-) -> List[TradeSignal]:
+def count_actionables_today_for_token(db: Session, token_hash: str) -> int:
     """
-    Return signals the receiver is allowed to see, respecting:
-      - subscriptions (who they follow)
-      - daily quota for **buy/sell** based on API key
-      - deliver once (avoid duplicates) via signal_reads
+    Count how many actionable (buy/sell) deliveries this token has for the current UTC day.
+    Uses sr.created_at if present; otherwise falls back to ts.created_at.
     """
-    sender_ids = list_subscriptions(db, receiver.id)
-    if not sender_ids:
-        return []
-
-    # Pull a buffer (unread)
-    unread = _unread_signals_for_receiver(db, receiver, sender_ids, limit=max_fetch)
-
-    # Quota remaining (None => unlimited)
-    remaining, _plan = remaining_quota_for_api_key(db, api_key)
-
-    deliver: List[TradeSignal] = []
-    buysells_taken = 0
-
-    for sig in unread:
-        if sig.action in ("buy", "sell"):
-            if remaining is None:
-                deliver.append(sig)
-            else:
-                if buysells_taken < remaining:
-                    deliver.append(sig)
-                    buysells_taken += 1
-                else:
-                    # skip buy/sell when quota exhausted
-                    continue
-        else:
-            # non-actionables always pass through
-            deliver.append(sig)
-
-    # Mark delivered so we won't send again next poll
-    record_signal_reads(db, receiver.id, (s.id for s in deliver))
-    return deliver
-
-
-# ---------- diagnostics (optional) ----------
-def count_opens_today(db: Session, user_id: int) -> int:
-    start = datetime.combine(today_utc(), datetime.min.time(), tzinfo=timezone.utc)
-    end   = datetime.combine(today_utc(), datetime.max.time(), tzinfo=timezone.utc)
-    q = (
-        select(func.count(SignalRead.id))
-        .join(TradeSignal, TradeSignal.id == SignalRead.signal_id)
-        .where(
-            SignalRead.user_id == user_id,
-            SignalRead.read_at >= start,
-            SignalRead.read_at <= end,
-            TradeSignal.action.in_(("buy", "sell")),
-        )
+    sql = text(
+        """
+        SELECT COUNT(*) AS c
+        FROM signal_reads sr
+        JOIN trade_signals ts ON ts.id = sr.signal_id
+        WHERE sr.token_hash = :th
+          AND ts.action IN ('buy','sell')
+          AND (COALESCE(sr.created_at, ts.created_at) AT TIME ZONE 'UTC')::date =
+              (NOW() AT TIME ZONE 'UTC')::date
+        """
     )
-    return int(db.execute(q).scalar_one() or 0)
+    c = db.execute(sql, {"th": token_hash}).scalar_one()
+    return int(c)
