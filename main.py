@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from database import SessionLocal, engine, Base
 import models
 import crud
+import logging
 from schemas import (
     TradeSignalCreate, TradeSignalOut, LatestSignalOut,
     TradeRecordCreate, TradeRecordOut,
@@ -65,72 +66,95 @@ def _verify_webhook(header_sig: Optional[str], payload: bytes) -> None:
         raise HTTPException(status_code=401, detail="Bad signature")
 
 # ---------------- Public: verify token ----------------
-@app.get("/auth/verify", response_model=VerifyOut)
-def verify_token(authorization: Optional[str] = Header(None, alias="Authorization"), db: Session = Depends(get_db)):
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing Authorization")
-    token = authorization.split(" ", 1)[1].strip()
-    ok, user, meta = crud.verify_token(db, token)
-    if not ok or not user:
-        raise HTTPException(status_code=401, detail="Invalid or inactive token")
-    return {"ok": True, "plan": meta.get("plan"), "daily_quota": meta.get("daily_quota"), "unlimited": meta.get("unlimited")}
-
-# ---------------- Webhook: plan change from WP ----------------
-@app.post("/webhook/payment-approved", response_model=PlanChangeOut)
-async def webhook_payment_approved(
-    request: Request,
-    x_signature: Optional[str] = Header(None, alias="X-Signature"),
+@app.get("/auth/verify")
+def verify_token(
+    authorization: str | None = Header(None, alias="Authorization"),
     db: Session = Depends(get_db),
 ):
-    payload = await request.body()
-    # Try HMAC
     try:
-        _verify_webhook(x_signature, payload)
+        if not authorization or not authorization.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail="Missing Authorization")
+
+        token = authorization.split(" ", 1)[1].strip()
+        ok, user, meta = crud.verify_token(db, token)
+
+        if not ok or not user:
+            raise HTTPException(status_code=401, detail="Invalid or inactive token")
+
+        # Normalize output to avoid validation edge cases
+        plan = (meta.get("plan") or "free")
+        daily_quota = meta.get("daily_quota", None)
+        unlimited = bool(meta.get("unlimited"))
+
+        return {"ok": True, "plan": plan, "daily_quota": daily_quota, "unlimited": unlimited}
+
     except HTTPException:
-        # Legacy secret in body/query
-        data_probe: Dict[str, Any] = {}
-        try:
-            data_probe = json.loads(payload or b"{}")
-        except Exception:
-            pass
-        legacy_secret = (data_probe.get("secret") if isinstance(data_probe, dict) else None) or request.query_params.get("secret")
-        if not legacy_secret or legacy_secret != os.getenv("WEBHOOK_SECRET"):
-            raise
-
-    # Parse JSON or form/query
-    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
-    data: Dict[str, Any] = {}
-    if content_type == "application/json":
-        try:
-            data = json.loads(payload or b"{}")
-        except Exception:
-            data = {}
-    else:
-        data = dict(request.query_params)
-        # naive body parse for x-www-form-urlencoded without starlette's parser
-        if not data and payload:
+        raise
+    except Exception as e:
+        logging.exception("verify_token crashed")
+        # Surface real cause instead of empty 500
+        raise HTTPException(status_code=500, detail=f"verify_token crash: {e.__class__.__name__}: {e}")
+# ---------------- Webhook: plan change from WP ----------------
+@app.post("/webhook/payment-approved")
+async def webhook_payment_approved(request: Request, db: Session = Depends(get_db)):
+    try:
+        # Parse payload safely
+        body = await request.body()
+        ct = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        data = {}
+        if ct == "application/json":
             try:
-                kv = payload.decode()
-                for pair in kv.split("&"):
-                    if "=" in pair:
-                        k, v = pair.split("=", 1)
-                        data.setdefault(k, v)
+                data = await request.json()
             except Exception:
-                pass
+                data = {}
+        else:
+            try:
+                form = await request.form()
+                data = dict(form)
+            except Exception:
+                data = {}
+        if not data:
+            # allow query fallback
+            data = dict(request.query_params)
 
-    user_id = int(data.get("user_id") or 0) or None
-    username = data.get("username")
-    email = data.get("email")
-    plan_raw = data.get("plan") or data.get("tier") or data.get("subscription") or "free"
-    rotate = str(data.get("rotate", "false")).lower() in ("1", "true", "yes")
+        # Accept identity via user_id or username or email
+        raw_uid = data.get("user_id")
+        user_id = None
+        if raw_uid not in (None, ""):
+            try:
+                user_id = int(raw_uid)
+            except Exception:
+                user_id = None
+        username = (data.get("username") or data.get("user") or None)
+        email = (data.get("email") or None)
 
-    plan = _coerce_plan(plan_raw)  # pending_* or junk -> free
+        if not (user_id or username or email):
+            raise HTTPException(status_code=400, detail="Need one of user_id, username, or email")
 
-    user = crud.ensure_user(db, user_id, username, email)
-    token_obj, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=rotate)
-    limits = crud.plan_limits(token_obj.plan)
+        # Plan
+        plan = (data.get("plan") or data.get("tier") or data.get("subscription") or "").strip().lower()
+        if plan not in ("free", "silver", "gold"):
+            plan = "free"
 
-    return {"ok": True, "user": user, "plan": token_obj.plan, "rotated": rotated, "api_key": token_obj.token, **limits}
+        # Upsert & update the ACTIVE token's plan, no rotation
+        user = crud.ensure_user(db, user_id, username, email)
+        tok, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=False)
+        limits = crud.plan_limits(plan)
+
+        return {
+            "ok": True,
+            "user": {"id": user.id, "username": user.username, "email": user.email, "plan": tok.plan},
+            "plan": tok.plan,
+            "rotated": rotated,
+            "api_key": tok.token,
+            **limits
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("webhook_payment_approved crashed")
+        raise HTTPException(status_code=500, detail=f"webhook crash: {e.__class__.__name__}: {e}")
 
 # ---------------- Admin: change plan (keep or rotate key) ----------------
 @app.post("/admin/plan", response_model=PlanChangeOut)
