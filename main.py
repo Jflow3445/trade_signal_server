@@ -1,4 +1,3 @@
-import os
 import json
 import hmac
 import hashlib
@@ -10,7 +9,8 @@ from sqlalchemy.orm import Session
 from database import SessionLocal, engine, Base
 import models
 import crud
-import logging
+import os, logging, requests
+
 from schemas import (
     TradeSignalCreate, TradeSignalOut, LatestSignalOut,
     TradeRecordCreate, TradeRecordOut,
@@ -278,25 +278,22 @@ def admin_subscribe(
     return {"ok": True, "receiver_id": r.id, "sender_id": s.id}
 
 # ---------------- Activations list ----------------
-@app.get("/activations")
-def activations(
-    authorization: str | None = Header(None, alias="Authorization"),
-    db: Session = Depends(get_db)
-):
-    admin_token = os.getenv("ADMIN_TOKEN") or os.getenv("ADMIN_SECRET")
-    is_admin = bool(admin_token) and (authorization == f"Bearer {admin_token}")
-
+@app.get("/activations", response_model=ActivationsList)
+def activations(db: Session = Depends(get_db)):
     users = db.query(models.User).filter(models.User.is_active == True).all()
-    items = []
-    for u in users:
-        row = {
-            "id": u.id,
-            "username": u.username,
-            "email": u.email,
-            "plan": u.plan,
-            "is_active": u.is_active,
-        }
-        if is_admin:
-            row["api_key"] = u.api_key
-        items.append(row)
-    return {"items": items}
+    return {"items": users}
+
+def notify_wordpress(user, token):
+    url = os.getenv("WP_CALLBACK_URL")
+    key = os.getenv("WP_CALLBACK_KEY")
+    if not url or not key:
+        return
+    try:
+        requests.post(
+            url,
+            json={"username": user.username, "email": user.email, "plan": token.plan, "api_key": token.token},
+            headers={"X-Callback-Key": key},
+            timeout=5,
+        )
+    except Exception as e:
+        logging.warning("WP callback failed: %s", e)
