@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Set, Dict, Any, Optional
 from collections.abc import Generator  # <-- for get_db type
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, Response, Query
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, Response, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy.orm import Session
@@ -50,7 +50,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         try:
             resp = await call_next(request)
             return resp
-        except Exception as e:
+        except Exception:
             logging.exception("Unhandled error")
             raise
 
@@ -177,24 +177,90 @@ def validate(payload: ValidateRequest, db: Session = Depends(get_db)):
     }
 
 # ----------------
-# Admin: issue/upgrade a token to a plan (helper)
+# Admin helpers (backward compatible)
+# ----------------
+def _get_admin_header(request: Request) -> Optional[str]:
+    # Accept both new and legacy admin header names
+    return request.headers.get("X-Admin-Key") or request.headers.get("X-Admin-Secret")
+
+def _check_admin(request: Request) -> None:
+    provided = _get_admin_header(request)
+    if not provided:
+        raise HTTPException(status_code=403, detail="Missing admin key")
+    # Accept either env var name
+    expected = os.getenv("ADMIN_KEY") or os.getenv("ADMIN_SECRET") or ""
+    if not expected or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+def _normalize_issue_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Back-compat normalizer:
+
+    New body:
+      { "username": str, "email": str?, "plan": str, "daily_quota": int|null?, "months_valid": int? }
+
+    Legacy body (current/older clients):
+      { "username_or_email": str, "plan": str, "quota": int|null?, "months": int?, "token": str? }
+
+    Returns a dict with: username_or_email, plan, token (optional passthrough)
+    """
+    username = data.get("username")
+    email = data.get("email")
+    username_or_email = data.get("username_or_email")
+
+    if not username_or_email:
+        if email:
+            username_or_email = email
+        elif username:
+            username_or_email = username
+
+    plan = data.get("plan") or data.get("tier")
+
+    # token from legacy callers (ignored by server logic if CRUD generates new ones)
+    token = data.get("token")
+
+    # We don't need daily_quota/months here because the existing CRUD signature
+    # is (db, username_or_email, token, plan). If you extend CRUD to accept
+    # quotas/validity, you can thread them through similarly.
+    return {
+        "username_or_email": username_or_email,
+        "plan": plan,
+        "token": token
+    }
+
+# ----------------
+# Admin: issue/upgrade/rotate token (BACKWARD COMPATIBLE)
 # ----------------
 @app.post("/admin/issue_token", response_model=AdminIssueTokenResponse)
 def admin_issue_token(
-    payload: AdminIssueTokenRequest,
+    request: Request,
     db: Session = Depends(get_db),
-    x_admin_secret: Optional[str] = Header(None, alias="X-Admin-Secret")
+    body: Dict[str, Any] = Body(...),
 ):
-    # very simple guard
-    admin_secret = os.getenv("ADMIN_SECRET", "")
-    if not admin_secret or x_admin_secret != admin_secret:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    # Guard with either X-Admin-Key or X-Admin-Secret and matching env var
+    _check_admin(request)
+
+    # Try strict pydantic model first (legacy schema in your codebase)
+    # If it fails (e.g., new body shape), normalize to legacy signature.
+    try:
+        req = AdminIssueTokenRequest(**body)  # legacy: username_or_email / token / plan
+        payload = {
+            "username_or_email": req.username_or_email,
+            "token": getattr(req, "token", None),
+            "plan": req.plan,
+        }
+    except Exception:
+        payload = _normalize_issue_payload(body)
+
+    if not payload.get("username_or_email") or not payload.get("plan"):
+        raise HTTPException(status_code=422, detail="Missing required fields (username/email and plan)")
 
     try:
-        user, tok = crud.admin_issue_token(db, payload.username_or_email, payload.token, payload.plan)
+        user, tok = crud.admin_issue_token(db, payload["username_or_email"], payload.get("token"), payload["plan"])
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+    # Keep legacy response shape (AdminIssueTokenResponse)
     return {
         "username": user.username,
         "email": user.email,
@@ -202,6 +268,10 @@ def admin_issue_token(
         "plan": tok.plan,
         "is_active": tok.is_active
     }
+
+# Legacy route aliases so old callers keep working
+app.add_api_route("/admin/rotate_token", admin_issue_token, methods=["POST"])
+app.add_api_route("/admin/issue-token", admin_issue_token, methods=["POST"])
 
 # ----------------
 # EA sync (optional endpoint your EA might call after login)
