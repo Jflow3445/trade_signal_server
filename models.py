@@ -1,63 +1,63 @@
-import datetime
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, JSON
+from sqlalchemy.orm import relationship
+from datetime import datetime, timezone
 
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, JSON
-from sqlalchemy.orm import declarative_base, relationship
-
-Base = declarative_base()
-
+from .database import Base
 
 class User(Base):
     __tablename__ = "users"
 
-    id          = Column(Integer, primary_key=True, index=True)
-    username    = Column(String, unique=True, index=True, nullable=False)
-    email       = Column(String, unique=True, index=True, nullable=True)
-    api_key     = Column(String, unique=True, index=True, nullable=False)
+    id = Column(Integer, primary_key=True, index=True)
 
-    # subscription / status
-    plan        = Column(String, default="free")  # free/silver/gold...
-    daily_quota = Column(Integer, nullable=True)  # null = unlimited
-    is_active   = Column(Boolean, default=True)
-    expires_at  = Column(DateTime, nullable=True)
+    username = Column(String(50), unique=True, index=True, nullable=False)
+    email = Column(String(255), unique=True, index=True, nullable=True)
+
+    is_active = Column(Boolean, default=True)
+    api_key = Column(String(255), unique=True, index=True, nullable=False)
+
+    plan = Column(String(16), nullable=True)        # free|silver|gold
+    daily_quota = Column(Integer, nullable=True)    # null => unlimited (gold)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
 
     # relationships
-    sent_signals = relationship("TradeSignal", back_populates="sender", cascade="all,delete-orphan")
-
-
-class Subscription(Base):
-    __tablename__ = "subscriptions"
-
-    id          = Column(Integer, primary_key=True, index=True)
-    receiver_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    sender_id   = Column(Integer, ForeignKey("users.id"), nullable=False)
-
-    receiver = relationship("User", foreign_keys=[receiver_id])
-    sender   = relationship("User", foreign_keys=[sender_id])
-
+    signals = relationship("TradeSignal", back_populates="user", lazy="selectin")
+    subscriptions = relationship("Subscription", back_populates="receiver", foreign_keys="Subscription.receiver_id", lazy="selectin")
 
 class TradeSignal(Base):
     __tablename__ = "trade_signals"
 
-    id         = Column(Integer, primary_key=True, index=True)
-    user_id    = Column(Integer, ForeignKey("users.id"), nullable=False)  # sender
-    symbol     = Column(String, index=True, nullable=False)
-    action     = Column(String, index=True, nullable=False)  # buy|sell|close|adjust_sl|...
-    sl_pips    = Column(Integer, nullable=True)
-    tp_pips    = Column(Integer, nullable=True)
-    lot_size   = Column(String, nullable=True)
-    details    = Column(JSON, nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
-    sender     = relationship("User", back_populates="sent_signals")
+    symbol = Column(String(16), nullable=False)
+    action = Column(String(16), nullable=False)  # buy|sell|adjust_sl|tp|close
+    sl_pips = Column(Integer, nullable=True)
+    tp_pips = Column(Integer, nullable=True)
+    lot_size = Column(String(32), nullable=True)  # keep as string to avoid float rounding issues
+    details = Column(JSON, nullable=True)
 
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    user = relationship("User", back_populates="signals")
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    receiver_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    receiver = relationship("User", back_populates="subscriptions", foreign_keys=[receiver_id])
+    sender = relationship("User", foreign_keys=[sender_id])
 
 class SignalRead(Base):
     __tablename__ = "signal_reads"
 
-    id          = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True, index=True)
     receiver_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    signal_id   = Column(Integer, ForeignKey("trade_signals.id"), nullable=False)
-    read_at     = Column(DateTime, default=datetime.datetime.utcnow)
+    signal_id = Column(Integer, ForeignKey("trade_signals.id"), nullable=False)
 
-    receiver = relationship("User")
-    signal   = relationship("TradeSignal")
+    # optional: per-token hash to ensure idempotence per API token
+    token_hash = Column(String(128), nullable=True)
+
+    read_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)

@@ -1,66 +1,82 @@
-from typing import Optional, Any
-import datetime
-from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, Field, EmailStr
+from datetime import datetime
 
-
-# ----------------------------
-# User schemas
-# ----------------------------
-
+# -----------------------------
+# USERS
+# -----------------------------
 class UserBase(BaseModel):
     username: str
-    email: Optional[str] = None
+    email: Optional[EmailStr] = None
+    is_active: bool = True
 
 class UserCreate(UserBase):
     api_key: str
-    plan: str = "free"
+    plan: Optional[str] = "free"
     daily_quota: Optional[int] = None
-    is_active: bool = True
-    expires_at: Optional[datetime.datetime] = None
+    expires_at: Optional[datetime] = None
 
-class User(UserBase):
+class UserOut(UserBase):
     id: int
     api_key: str
-    plan: str
+    plan: Optional[str]
     daily_quota: Optional[int]
-    is_active: bool
-    expires_at: Optional[datetime.datetime]
+    expires_at: Optional[datetime]
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
+class UserPlanUpdate(BaseModel):
+    plan: Optional[str] = None
+    daily_quota: Optional[int] = None
+    expires_at: Optional[datetime] = None
 
-# ----------------------------
-# Signal schemas
-# ----------------------------
-
+# -----------------------------
+# SIGNALS
+# -----------------------------
 class SignalBase(BaseModel):
-    symbol: str
-    action: str
+    symbol: str = Field(..., max_length=16)
+    action: str = Field(..., description="buy|sell|adjust_sl|tp|close")
     sl_pips: Optional[int] = None
     tp_pips: Optional[int] = None
     lot_size: Optional[float] = None
-    details: Optional[Any] = None
+    details: Optional[Dict[str, Any]] = None
 
 class SignalCreate(SignalBase):
     pass
 
-class Signal(SignalBase):
+class SignalOut(SignalBase):
     id: int
-    created_at: datetime.datetime
+    created_at: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
+# -----------------------------
+# SUBSCRIPTIONS
+# -----------------------------
+class SubscriptionCreate(BaseModel):
+    receiver_id: int
+    sender_id: int
 
-# ----------------------------
-# Subscription schemas
-# ----------------------------
-
-class Subscription(BaseModel):
+class SubscriptionOut(BaseModel):
     id: int
     receiver_id: int
     sender_id: int
 
     class Config:
-        orm_mode = True
+        from_attributes = True
+
+# -----------------------------
+# VALIDATION
+# -----------------------------
+class ValidateRequest(BaseModel):
+    email: Optional[EmailStr] = None
+    api_key: Optional[str] = None
+
+class ValidateResponse(BaseModel):
+    ok: bool
+    is_active: bool
+    plan: str
+    daily_quota: Optional[int]
+    expires_at: Optional[datetime] = None

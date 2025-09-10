@@ -1,280 +1,291 @@
-import datetime
-from typing import List, Optional, Tuple, Dict, Any
-
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_, or_
+from sqlalchemy import func, and_
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple, Dict
 
 from . import models, schemas
 
+# ------------------------------
+# USERS
+# ------------------------------
+def get_user_by_email_or_api(db: Session, email: Optional[str] = None, api_key: Optional[str] = None) -> Optional[models.User]:
+    """
+    Retrieve a user by email OR api_key. Either parameter may be provided.
+    If both are provided, email is used first then api_key fallback.
+    """
+    query = db.query(models.User)
+    if email:
+        user = query.filter(func.lower(models.User.email) == func.lower(email)).first()
+        if user:
+            return user
+    if api_key:
+        return query.filter(models.User.api_key == api_key).first()
+    return None
 
-# ----------------------------
-# Users
-# ----------------------------
 
 def get_user_by_api_key(db: Session, api_key: str) -> Optional[models.User]:
     return db.query(models.User).filter(models.User.api_key == api_key).first()
 
+
 def get_user_by_email(db: Session, email: str) -> Optional[models.User]:
-    return db.query(models.User).filter(models.User.email == email).first()
+    return db.query(models.User).filter(func.lower(models.User.email) == func.lower(email)).first()
 
-def create_user(db: Session, user: schemas.UserCreate) -> models.User:
-    db_user = models.User(**user.dict())
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return db_user
 
-def update_user_plan(
-    db: Session,
-    user: models.User,
-    plan: str,
-    daily_quota: Optional[int] = None,
-    expires_at: Optional[datetime.datetime] = None,
-    is_active: Optional[bool] = None,
-) -> models.User:
-    user.plan = plan
-    if daily_quota is not None:
-        user.daily_quota = daily_quota
-    if expires_at is not None:
-        user.expires_at = expires_at
-    if is_active is not None:
-        user.is_active = is_active
+def list_users(db: Session, skip: int = 0, limit: int = 100) -> List[models.User]:
+    return db.query(models.User).offset(skip).limit(limit).all()
+
+
+def create_user(db: Session, user_in: schemas.UserCreate) -> models.User:
+    user = models.User(
+        username=user_in.username,
+        email=user_in.email,
+        is_active=user_in.is_active,
+        api_key=user_in.api_key,
+        plan=user_in.plan,
+        daily_quota=user_in.daily_quota,
+        expires_at=user_in.expires_at,
+    )
     db.add(user)
     db.commit()
     db.refresh(user)
     return user
 
 
-# ----------------------------
-# Subscriptions
-# ----------------------------
+def update_user_plan_and_quota(
+    db: Session,
+    user: models.User,
+    plan: Optional[str] = None,
+    daily_quota: Optional[int] = None,
+    expires_at: Optional[datetime] = None,
+) -> models.User:
+    """
+    Update plan/daily_quota/expires_at for a user. Any None param is ignored.
+    """
+    if plan is not None:
+        user.plan = plan
+    if daily_quota is not None:
+        user.daily_quota = daily_quota
+    if expires_at is not None:
+        user.expires_at = expires_at
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
 
-def create_subscription(db: Session, receiver_id: int, sender_id: int) -> models.Subscription:
+
+# ------------------------------
+# SIGNALS
+# ------------------------------
+def create_signal(db: Session, signal_in: schemas.SignalCreate, user_id: int) -> models.TradeSignal:
+    signal = models.TradeSignal(
+        user_id=user_id,
+        symbol=signal_in.symbol,
+        action=signal_in.action,
+        sl_pips=signal_in.sl_pips,
+        tp_pips=signal_in.tp_pips,
+        lot_size=signal_in.lot_size,
+        details=signal_in.details,
+    )
+    db.add(signal)
+    db.commit()
+    db.refresh(signal)
+    return signal
+
+
+def list_signals_for_sender(db: Session, sender_id: int, skip: int = 0, limit: int = 100) -> List[models.TradeSignal]:
+    return (
+        db.query(models.TradeSignal)
+        .filter(models.TradeSignal.user_id == sender_id)
+        .order_by(models.TradeSignal.id.desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+
+
+def list_signals_for_receiver(
+    db: Session,
+    receiver: models.User,
+    since_id: Optional[int] = None,
+    symbol: Optional[str] = None,
+    action: Optional[str] = None,
+    limit: int = 200,
+) -> List[Dict]:
+    """
+    Fetch signals from the user's subscriptions (senders they follow).
+    Apply optional filters (since_id, symbol, action).
+    Return plain dicts (id, symbol, action, sl_pips, tp_pips, lot_size, details, created_at)
+    """
+    # Find sender_ids user is subscribed to
+    subs = db.query(models.Subscription).filter(models.Subscription.receiver_id == receiver.id).all()
+    sender_ids = [s.sender_id for s in subs]
+    if not sender_ids:
+        return []
+
+    q = (
+        db.query(models.TradeSignal)
+        .filter(models.TradeSignal.user_id.in_(sender_ids))
+    )
+
+    if since_id:
+        q = q.filter(models.TradeSignal.id > since_id)
+    if symbol:
+        q = q.filter(func.lower(models.TradeSignal.symbol) == func.lower(symbol))
+    if action:
+        q = q.filter(func.lower(models.TradeSignal.action) == func.lower(action))
+
+    q = q.order_by(models.TradeSignal.id.desc()).limit(limit)
+    rows = q.all()
+
+    result = []
+    for s in rows:
+        result.append({
+            "id": s.id,
+            "symbol": s.symbol,
+            "action": s.action,
+            "sl_pips": s.sl_pips,
+            "tp_pips": s.tp_pips,
+            "lot_size": s.lot_size,
+            "details": s.details,
+            "created_at": s.created_at.replace(tzinfo=timezone.utc),
+        })
+    return list(reversed(result))  # ascending by id to be friendly to consumers
+
+
+# ------------------------------
+# SUBSCRIPTIONS
+# ------------------------------
+def add_subscription(db: Session, receiver_id: int, sender_id: int) -> models.Subscription:
     sub = models.Subscription(receiver_id=receiver_id, sender_id=sender_id)
     db.add(sub)
     db.commit()
     db.refresh(sub)
     return sub
 
-def delete_subscription(db: Session, receiver_id: int, sender_id: int) -> bool:
-    sub = db.query(models.Subscription).filter(
-        models.Subscription.receiver_id == receiver_id,
-        models.Subscription.sender_id == sender_id,
-    ).first()
+
+def remove_subscription(db: Session, receiver_id: int, sender_id: int) -> bool:
+    sub = (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.receiver_id == receiver_id,
+            models.Subscription.sender_id == sender_id,
+        )
+        .first()
+    )
     if not sub:
         return False
     db.delete(sub)
     db.commit()
     return True
 
-def list_receiver_senders(db: Session, receiver_id: int) -> List[models.User]:
-    # All senders that receiver follows
-    q = (
-        db.query(models.User)
-        .join(models.Subscription, models.Subscription.sender_id == models.User.id)
+
+def list_subscriptions(db: Session, receiver_id: int) -> List[models.Subscription]:
+    return (
+        db.query(models.Subscription)
         .filter(models.Subscription.receiver_id == receiver_id)
+        .all()
     )
-    return q.all()
-
-def list_sender_receivers(db: Session, sender_id: int) -> List[models.User]:
-    # All receivers that follow the sender
-    q = (
-        db.query(models.User)
-        .join(models.Subscription, models.Subscription.receiver_id == models.User.id)
-        .filter(models.Subscription.sender_id == sender_id)
-    )
-    return q.all()
 
 
-# ----------------------------
-# Signals
-# ----------------------------
-
-def create_signal(
-    db: Session,
-    sender_id: int,
-    signal: schemas.SignalCreate,
-) -> models.TradeSignal:
-    data = signal.dict()
-    db_signal = models.TradeSignal(user_id=sender_id, **data)
-    db.add(db_signal)
-    db.commit()
-    db.refresh(db_signal)
-    return db_signal
-
-
-def list_signals_for_receiver(
-    db: Session,
-    receiver_id: int,
-    limit: int = 50,
-    offset: int = 0,
-    since_id: Optional[int] = None,
-    symbols: Optional[List[str]] = None,
-    actions: Optional[List[str]] = None,
-) -> List[models.TradeSignal]:
+# ------------------------------
+# QUOTA / USAGE
+# ------------------------------
+def count_open_actions_today_for_user(db: Session, user_id: int) -> int:
     """
-    Fetch signals from all senders that this receiver is subscribed to.
-    Newest first by default.
+    Count 'buy' and 'sell' signals created by this user today (UTC).
     """
-    # join subscriptions -> trade_signals where trade_signals.user_id = sender_id
-    q = (
+    today_utc = datetime.now(timezone.utc).date()
+    tomorrow_utc = today_utc + timedelta(days=1)
+    return (
         db.query(models.TradeSignal)
-        .join(models.Subscription, models.Subscription.sender_id == models.TradeSignal.user_id)
-        .filter(models.Subscription.receiver_id == receiver_id)
+        .filter(
+            models.TradeSignal.user_id == user_id,
+            models.TradeSignal.action.in_(["buy", "sell"]),
+            models.TradeSignal.created_at >= datetime.combine(today_utc, datetime.min.time(), tzinfo=timezone.utc),
+            models.TradeSignal.created_at < datetime.combine(tomorrow_utc, datetime.min.time(), tzinfo=timezone.utc),
+        )
+        .count()
     )
 
-    if since_id is not None:
-        q = q.filter(models.TradeSignal.id > since_id)
 
-    if symbols:
-        q = q.filter(models.TradeSignal.symbol.in_(symbols))
-
-    if actions:
-        q = q.filter(models.TradeSignal.action.in_(actions))
-
-    q = q.order_by(models.TradeSignal.id.desc())
-
-    if offset:
-        q = q.offset(offset)
-    if limit:
-        q = q.limit(limit)
-
-    return q.all()
-
-
-def list_signals_for_sender(
-    db: Session,
-    sender_id: int,
-    limit: int = 50,
-    offset: int = 0,
-    since_id: Optional[int] = None,
-    symbols: Optional[List[str]] = None,
-    actions: Optional[List[str]] = None,
-) -> List[models.TradeSignal]:
+def plan_to_quota(plan: Optional[str]) -> Optional[int]:
     """
-    Fetch signals authored by a given sender (useful for debugging).
+    Map plan -> daily quota for 'buy'/'sell' opens.
+    None means unlimited.
     """
-    q = db.query(models.TradeSignal).filter(models.TradeSignal.user_id == sender_id)
-
-    if since_id is not None:
-        q = q.filter(models.TradeSignal.id > since_id)
-
-    if symbols:
-        q = q.filter(models.TradeSignal.symbol.in_(symbols))
-
-    if actions:
-        q = q.filter(models.TradeSignal.action.in_(actions))
-
-    q = q.order_by(models.TradeSignal.id.desc())
-
-    if offset:
-        q = q.offset(offset)
-    if limit:
-        q = q.limit(limit)
-
-    return q.all()
+    if not plan:
+        return 1
+    p = plan.lower()
+    if p == "free":
+        return 1
+    if p == "silver":
+        return 3
+    if p == "gold":
+        return None
+    # default
+    return 1
 
 
-# ----------------------------
-# Reads / Acknowledgements
-# ----------------------------
+def within_quota(db: Session, user: models.User) -> bool:
+    """
+    Check if user is within open-action quota for today.
+    """
+    if not user.is_active:
+        return False
+    if user.expires_at and user.expires_at < datetime.now(timezone.utc):
+        return False
 
-def mark_signal_read(
+    # Determine effective daily quota
+    eff_quota = user.daily_quota if user.daily_quota is not None else plan_to_quota(user.plan)
+    if eff_quota is None:
+        return True  # unlimited
+
+    used = count_open_actions_today_for_user(db, user.id)
+    return used < eff_quota
+
+
+# ------------------------------
+# SIGNAL READS (DELIVERY)
+# ------------------------------
+def record_signal_read(
     db: Session,
     receiver_id: int,
     signal_id: int,
+    token_hash: Optional[str] = None,
 ) -> models.SignalRead:
-    sr = models.SignalRead(receiver_id=receiver_id, signal_id=signal_id)
+    sr = models.SignalRead(
+        receiver_id=receiver_id,
+        signal_id=signal_id,
+        token_hash=token_hash,
+    )
     db.add(sr)
     db.commit()
     db.refresh(sr)
     return sr
 
-def list_reads_for_receiver(
+
+def already_read_this_signal(
     db: Session,
     receiver_id: int,
-    limit: int = 100,
-    offset: int = 0,
-) -> List[models.SignalRead]:
-    q = db.query(models.SignalRead).filter(models.SignalRead.receiver_id == receiver_id)
-    q = q.order_by(models.SignalRead.read_at.desc())
-    if offset:
-        q = q.offset(offset)
-    if limit:
-        q = q.limit(limit)
-    return q.all()
-
-
-# ----------------------------
-# Quota helpers
-# ----------------------------
-
-def count_actionable_signals_today(
-    db: Session,
-    receiver_id: int,
-    senders: Optional[List[int]] = None,
-) -> int:
-    """
-    How many actionable signals (buy/sell) has the receiver pulled today across all senders?
-    Uses UTC date window.
-    """
-    today = datetime.datetime.utcnow().date()
-    start = datetime.datetime.combine(today, datetime.time.min)
-    end = datetime.datetime.combine(today, datetime.time.max)
-
-    q = (
-        db.query(func.count(models.TradeSignal.id))
-        .join(models.Subscription, models.Subscription.sender_id == models.TradeSignal.user_id)
-        .filter(models.Subscription.receiver_id == receiver_id)
-        .filter(
-            models.TradeSignal.action.in_(["buy", "sell"]),
-            models.TradeSignal.created_at >= start,
-            models.TradeSignal.created_at <= end,
-        )
+    signal_id: int,
+    token_hash: Optional[str] = None,
+) -> bool:
+    q = db.query(models.SignalRead).filter(
+        models.SignalRead.receiver_id == receiver_id,
+        models.SignalRead.signal_id == signal_id,
     )
-    if senders:
-        q = q.filter(models.TradeSignal.user_id.in_(senders))
+    if token_hash:
+        q = q.filter(models.SignalRead.token_hash == token_hash)
+    return db.query(q.exists()).scalar()
 
-    return q.scalar() or 0
 
-
-def count_actionable_signals_today_per_sender(
-    db: Session,
-    receiver_id: int,
-) -> Dict[int, int]:
-    """
-    Return a dict of sender_id -> count of actionable signals today visible to receiver.
-    """
-    today = datetime.datetime.utcnow().date()
-    start = datetime.datetime.combine(today, datetime.time.min)
-    end = datetime.datetime.combine(today, datetime.time.max)
-
-    rows = (
-        db.query(models.TradeSignal.user_id, func.count(models.TradeSignal.id))
-        .join(models.Subscription, models.Subscription.sender_id == models.TradeSignal.user_id)
-        .filter(
-            models.Subscription.receiver_id == receiver_id,
-            models.TradeSignal.action.in_(["buy", "sell"]),
-            models.TradeSignal.created_at >= start,
-            models.TradeSignal.created_at <= end,
-        )
-        .group_by(models.TradeSignal.user_id)
+# ------------------------------
+# ADMIN / UTIL
+# ------------------------------
+def list_all_signals(db: Session, limit: int = 500) -> List[models.TradeSignal]:
+    return (
+        db.query(models.TradeSignal)
+        .order_by(models.TradeSignal.id.desc())
+        .limit(limit)
         .all()
     )
-    return {user_id: cnt for (user_id, cnt) in rows}
-
-
-# ----------------------------
-# Admin / Maintenance
-# ----------------------------
-
-def purge_old_signals(db: Session, days: int = 90) -> int:
-    """
-    Delete signals older than `days`. Returns number deleted.
-    """
-    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
-    q = db.query(models.TradeSignal).filter(models.TradeSignal.created_at < cutoff)
-    n = q.count()
-    q.delete(synchronize_session=False)
-    db.commit()
-    return n

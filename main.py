@@ -1,165 +1,196 @@
-import os
-import datetime
-from typing import List, Optional
+from fastapi import FastAPI, Depends, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
+from typing import Optional, List, Dict
+from datetime import datetime, timezone
+import hashlib
+import logging
 
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, Response, status
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-
+from .database import get_db, Base, engine
+from . import models, schemas, crud
 from sqlalchemy.orm import Session
 
-from .database import SessionLocal
-from . import models, schemas, crud
-
-# ----------------------------
-# App & Middleware
-# ----------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("nister")
 
 app = FastAPI(title="Trade Signal Server")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tune in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Create tables on startup if not exist
+Base.metadata.create_all(bind=engine)
 
-# ----------------------------
-# DB Dependency
-# ----------------------------
+@app.get("/health")
+def health():
+    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# ----------------------------
-# Auth helpers
-# ----------------------------
-
-def bearer_token(auth_header: Optional[str]) -> Optional[str]:
-    if not auth_header:
+# --------------------------
+# AUTH HELPERS
+# --------------------------
+def get_bearer_token(authorization: Optional[str]) -> Optional[str]:
+    if not authorization:
         return None
-    parts = auth_header.split()
+    parts = authorization.split()
     if len(parts) == 2 and parts[0].lower() == "bearer":
         return parts[1]
     return None
 
-def authenticate_by_api_key(db: Session, token: str) -> models.User:
-    user = crud.get_user_by_api_key(db, token)
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+# --------------------------
+# VALIDATE
+# --------------------------
+@app.post("/validate", response_model=schemas.ValidateResponse)
+def validate(payload: schemas.ValidateRequest, db: Session = Depends(get_db)):
+    """
+    Validate a user by email + api_key.
+    """
+    user = crud.get_user_by_email_or_api(db, email=payload.email, api_key=payload.api_key)
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid API token")
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="User not active")
-    if user.expires_at and user.expires_at < datetime.datetime.utcnow():
-        raise HTTPException(status_code=403, detail="Subscription expired")
-    return user
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-# ----------------------------
-# Health
-# ----------------------------
+    # active and not expired
+    is_active = bool(user.is_active) and (not user.expires_at or user.expires_at >= datetime.now(timezone.utc))
+    daily_quota = user.daily_quota if user.daily_quota is not None else crud.plan_to_quota(user.plan)
 
-@app.get("/health")
-def health() -> dict:
-    return {"ok": True, "time": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    return schemas.ValidateResponse(
+        ok=True,
+        is_active=is_active,
+        plan=user.plan or "free",
+        daily_quota=daily_quota,
+        expires_at=user.expires_at.replace(tzinfo=timezone.utc) if user.expires_at else None,
+    )
 
-# ----------------------------
-# Validate
-# ----------------------------
-
-class ValidateReq(BaseModel):
-    email: str
-    api_key: str
-
-@app.post("/validate")
-def validate(req: ValidateReq, db: Session = Depends(get_db)) -> dict:
-    u = crud.get_user_by_email(db, req.email)
-    if not u or u.api_key != req.api_key:
-        return {"ok": False}
-    return {
-        "ok": True,
-        "is_active": u.is_active,
-        "plan": u.plan,
-        "daily_quota": u.daily_quota,
-        "expires_at": u.expires_at.isoformat() if u.expires_at else None,
-    }
-
-# ----------------------------
-# Signals
-# ----------------------------
-
-@app.post("/signals", response_model=schemas.Signal)
+# --------------------------
+# CREATE SIGNAL (Sender)
+# --------------------------
+@app.post("/signals", response_model=schemas.SignalOut)
 def post_signal(
-    signal: schemas.SignalCreate,
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-    db: Session = Depends(get_db),
+    payload: schemas.SignalCreate,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
 ):
-    token = bearer_token(authorization)
+    token = get_bearer_token(authorization)
     if not token:
-        raise HTTPException(status_code=401, detail="Missing bearer token")
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
 
-    sender = authenticate_by_api_key(db, token)
+    sender = crud.get_user_by_api_key(db, token)
+    if not sender:
+        raise HTTPException(status_code=401, detail="Invalid API token")
 
-    # Create signal authored by sender
-    s = crud.create_signal(db, sender_id=sender.id, signal=signal)
-    return s
+    # Only allow known actions
+    if payload.action not in {"buy", "sell", "adjust_sl", "tp", "close"}:
+        raise HTTPException(status_code=400, detail="Invalid action")
 
-@app.get("/signals", response_model=List[schemas.Signal])
+    # If it's an opening action, enforce sender's quota
+    if payload.action in {"buy", "sell"}:
+        if not crud.within_quota(db, sender):
+            raise HTTPException(status_code=403, detail="Quota exhausted for today")
+
+    sig = crud.create_signal(db, payload, user_id=sender.id)
+    return schemas.SignalOut.from_orm(sig)
+
+# --------------------------
+# LIST SIGNALS (Receiver)
+# --------------------------
+@app.get("/signals", response_model=List[schemas.SignalOut])
 def get_signals(
     request: Request,
-    response: Response,
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-    limit: int = 50,
-    offset: int = 0,
+    authorization: Optional[str] = Header(None),
     since_id: Optional[int] = None,
-    symbols: Optional[str] = None,
-    actions: Optional[str] = None,
-    db: Session = Depends(get_db),
+    symbol: Optional[str] = None,
+    action: Optional[str] = None,
+    limit: int = 200,
+    db: Session = Depends(get_db)
 ):
-    """
-    Fetch signals for the authenticated receiver (who follows senders).
-    Note: symbols/actions are comma-separated lists in query.
-    """
-    token = bearer_token(authorization)
+    token = get_bearer_token(authorization)
     if not token:
-        raise HTTPException(status_code=401, detail="Missing bearer token")
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
 
-    receiver = authenticate_by_api_key(db, token)
+    receiver = crud.get_user_by_api_key(db, token)
+    if not receiver:
+        raise HTTPException(status_code=401, detail="Invalid API token")
 
-    sym_list = [s.strip().upper() for s in symbols.split(",")] if symbols else None
-    act_list = [a.strip().lower() for a in actions.split(",")] if actions else None
+    # Enforce receiver must be active / not expired
+    if not receiver.is_active or (receiver.expires_at and receiver.expires_at < datetime.now(timezone.utc)):
+        raise HTTPException(status_code=403, detail="Inactive or expired account")
 
-    # Apply quota headers for visibility (not enforcement)
-    response.headers["X-Plan"] = receiver.plan or ""
-    response.headers["X-Daily-Quota"] = str(receiver.daily_quota) if receiver.daily_quota is not None else "unlimited"
-
-    signals = crud.list_signals_for_receiver(
-        db, receiver_id=receiver.id, limit=limit, offset=offset, since_id=since_id, symbols=sym_list, actions=act_list
+    items = crud.list_signals_for_receiver(
+        db=db,
+        receiver=receiver,
+        since_id=since_id,
+        symbol=symbol,
+        action=action,
+        limit=min(limit, 500),
     )
-    return signals
 
-# ----------------------------
-# Admin (minimal)
-# ----------------------------
+    # Record a read marker for each returned signal (per-token hash to avoid duplicates)
+    token_h = hash_token(token)
+    for it in items:
+        try:
+            if not crud.already_read_this_signal(db, receiver_id=receiver.id, signal_id=it["id"], token_hash=token_h):
+                crud.record_signal_read(db, receiver_id=receiver.id, signal_id=it["id"], token_hash=token_h)
+        except Exception as e:
+            logger.warning(f"record_signal_read failed for receiver={receiver.id} signal={it['id']}: {e}")
 
-class UpgradeReq(BaseModel):
-    email: str
-    plan: str
-    daily_quota: Optional[int] = None
-    days: Optional[int] = 30
+    # Set quota headers for visibility
+    eff_quota = receiver.daily_quota if receiver.daily_quota is not None else crud.plan_to_quota(receiver.plan)
+    used_opens = crud.count_open_actions_today_for_user(db, receiver.id)
+    remaining = None if eff_quota is None else max(eff_quota - used_opens, 0)
 
-@app.post("/admin/upgrade")
-def admin_upgrade(req: UpgradeReq, db: Session = Depends(get_db)):
-    u = crud.get_user_by_email(db, req.email)
+    headers = {}
+    if eff_quota is None:
+        headers["X-Plan"] = receiver.plan or "gold"
+        headers["X-Quota-Daily"] = "unlimited"
+        headers["X-Quota-Used-Opens-Today"] = str(used_opens)
+    else:
+        headers["X-Plan"] = receiver.plan or "free"
+        headers["X-Quota-Daily"] = str(eff_quota)
+        headers["X-Quota-Used-Opens-Today"] = str(used_opens)
+        headers["X-Quota-Remaining"] = str(remaining)
+
+    return JSONResponse(content=items, headers=headers)
+
+# --------------------------
+# ADMIN: Users, Subs, Signals
+# --------------------------
+@app.get("/admin/users", response_model=List[schemas.UserOut])
+def admin_list_users(db: Session = Depends(get_db)):
+    return db.query(models.User).order_by(models.User.id.asc()).all()
+
+@app.post("/admin/users", response_model=schemas.UserOut)
+def admin_create_user(user_in: schemas.UserCreate, db: Session = Depends(get_db)):
+    u = crud.create_user(db, user_in)
+    return u
+
+@app.post("/admin/users/{user_id}/plan", response_model=schemas.UserOut)
+def admin_update_plan(
+    user_id: int,
+    update: schemas.UserPlanUpdate,
+    db: Session = Depends(get_db)
+):
+    u = db.query(models.User).get(user_id)
     if not u:
-        raise HTTPException(status_code=404, detail="user not found")
+        raise HTTPException(status_code=404, detail="User not found")
+    u = crud.update_user_plan_and_quota(
+        db, u,
+        plan=update.plan,
+        daily_quota=update.daily_quota,
+        expires_at=update.expires_at,
+    )
+    return u
 
-    expires = None
-    if req.days and req.days > 0:
-        expires = datetime.datetime.utcnow() + datetime.timedelta(days=req.days)
+@app.post("/admin/subscriptions", response_model=schemas.SubscriptionOut)
+def admin_add_sub(sub: schemas.SubscriptionCreate, db: Session = Depends(get_db)):
+    s = crud.add_subscription(db, sub.receiver_id, sub.sender_id)
+    return s
 
-    crud.update_user_plan(db, user=u, plan=req.plan, daily_quota=req.daily_quota, expires_at=expires, is_active=True)
-    return {"ok": True, "user": {"email": u.email, "plan": u.plan, "daily_quota": u.daily_quota}}
+@app.delete("/admin/subscriptions", response_model=schemas.SubscriptionOut)
+def admin_del_sub(sub: schemas.SubscriptionCreate, db: Session = Depends(get_db)):
+    ok = crud.remove_subscription(db, sub.receiver_id, sub.sender_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    return JSONResponse({"ok": True})
+
+@app.get("/admin/signals", response_model=List[schemas.SignalOut])
+def admin_list_all(db: Session = Depends(get_db)):
+    rows = crud.list_all_signals(db, limit=500)
+    return [schemas.SignalOut.from_orm(r) for r in rows]
