@@ -143,7 +143,27 @@ def verify_token(
         daily_quota = meta.get("daily_quota", None)
         unlimited = bool(meta.get("unlimited"))
 
-        return {"ok": True, "plan": plan, "daily_quota": daily_quota, "unlimited": unlimited}
+        # Compute remaining_today WITHOUT consuming quota
+        remaining_today = None
+        if not unlimited and daily_quota is not None:
+            token_hash = crud.hash_token_for_read(token)
+            used = crud.count_reads_today(db, user, token_hash=token_hash)
+            remaining_today = max(0, int(daily_quota) - used)
+
+        # include expiry (from crud meta) and current server time
+        expires_at = meta.get("expires_at")
+        server_time = datetime.now(timezone.utc).isoformat()
+
+        return {
+            "ok": True,
+            "username": user.username,
+            "plan": plan,
+            "daily_quota": daily_quota,
+            "unlimited": unlimited,
+            "remaining_today": remaining_today,  # None for unlimited
+            "expires_at": expires_at,            # ISO string or None
+            "server_time": server_time,          # ISO string
+        }
 
     except HTTPException:
         raise

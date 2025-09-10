@@ -119,24 +119,23 @@ def upsert_active_token(db: Session, user: User, plan: Optional[str] = None, rot
         return new_tok, rotated or True
 
 def verify_token(db: Session, api_key: str) -> Tuple[bool, Optional[User], Dict[str, Any]]:
-    """
-    Auth is only valid if there is a live APIToken row:
-      - token match
-      - is_active = True
-      - expires_at > now
-      - user.is_active = True
-    No legacy fallback to User.api_key for auth (prevents expired token use).
-    """
     now = utc_now()
     tok = db.query(APIToken).filter(
         APIToken.token == api_key,
         APIToken.is_active == True,
         APIToken.expires_at > now
     ).first()
+
     if tok and tok.user and tok.user.is_active:
         limits = plan_limits(tok.plan)
-        return True, tok.user, {"plan": tok.plan, **limits}
+        expires_iso = (
+            tok.expires_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+            if tok.expires_at else None
+        )
+        return True, tok.user, {"plan": tok.plan, **limits, "expires_at": expires_iso}
+
     return False, None, {"reason": "invalid_or_expired_token"}
+
 
 def purge_expired_tokens(db: Session) -> int:
     """
