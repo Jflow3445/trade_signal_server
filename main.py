@@ -2,7 +2,7 @@ import json
 import hmac
 import hashlib
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -14,22 +14,24 @@ import os, logging, requests
 from schemas import (
     TradeSignalCreate, TradeSignalOut, LatestSignalOut,
     TradeRecordCreate, TradeRecordOut,
-    PlanChangeIn, PlanChangeOut, VerifyOut, ActivationsList,
-    AdminIssueTokenRequest, AdminIssueTokenResponse, UserOut
+    PlanChangeIn, PlanChangeOut, ActivationsList,
+    AdminIssueTokenRequest, AdminIssueTokenResponse
 )
 
 APP_NAME = "Nister Trade Server"
 
 app = FastAPI(title=APP_NAME)
 
+# ---- CORS: restrict via env ----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
+    allow_origins=[o for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     max_age=3600,
 )
+
 
 def get_db():
     db = SessionLocal()
@@ -38,42 +40,57 @@ def get_db():
     finally:
         db.close()
 
+
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
-    # Purge any expired tokens at boot
+    # Best-effort purge at boot
     try:
         db = SessionLocal()
-        crud.purge_expired_tokens(db)
-        db.commit()
+        purged = crud.purge_expired_tokens(db)
+        if purged:
+            db.commit()
     except Exception:
         db.rollback()
+        logging.exception("startup purge_expired_tokens failed")
     finally:
         db.close()
+
 
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
+
 # ---------------- Auth helpers ----------------
 def _coerce_plan(p: Optional[str]) -> str:
     return crud.normalize_plan(p)
 
+
 def _require_admin_bearer(authorization: Optional[str]) -> None:
-    # allow ADMIN_TOKEN, ADMIN_SECRET, or ADMIN_KEY for compatibility
+    # Accept any of the envs for backwards compatibility
     admin = os.getenv("ADMIN_TOKEN") or os.getenv("ADMIN_SECRET") or os.getenv("ADMIN_KEY")
     if not admin or not authorization or authorization != f"Bearer {admin}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+
 def _verify_webhook(header_sig: Optional[str], payload: bytes) -> None:
+    """
+    Verify WP->server webhook:
+      - header: X-Webhook-Signature
+      - algo: HMAC-SHA256 over the raw JSON body
+      - secret: WEBHOOK_SECRET (env)
+    """
     secret = os.getenv("WEBHOOK_SECRET")
     if not secret:
-        return
+        # If not set, reject to avoid unauthenticated plan changes in prod
+        raise HTTPException(status_code=401, detail="Webhook secret not configured")
     if not header_sig:
         raise HTTPException(status_code=401, detail="Missing signature")
-    mac = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    mac = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(mac, header_sig):
         raise HTTPException(status_code=401, detail="Bad signature")
+
 
 def notify_wordpress(user, token):
     """
@@ -96,6 +113,7 @@ def notify_wordpress(user, token):
     except Exception as e:
         logging.warning("WP callback failed: %s", e)
 
+
 # ---------------- Public: verify token ----------------
 @app.get("/auth/verify")
 def verify_token(
@@ -103,7 +121,12 @@ def verify_token(
     db: Session = Depends(get_db),
 ):
     # opportunistic purge to keep the table clean
-    crud.purge_expired_tokens(db)
+    try:
+        purged = crud.purge_expired_tokens(db)
+        if purged:
+            db.commit()
+    except Exception:
+        db.rollback()
 
     try:
         if not authorization or not authorization.lower().startswith("bearer "):
@@ -115,7 +138,7 @@ def verify_token(
         if not ok or not user:
             raise HTTPException(status_code=401, detail="Invalid or inactive token")
 
-        # Normalize output to avoid validation edge cases
+        # Normalize output
         plan = (meta.get("plan") or "free")
         daily_quota = meta.get("daily_quota", None)
         unlimited = bool(meta.get("unlimited"))
@@ -128,20 +151,29 @@ def verify_token(
         logging.exception("verify_token crashed")
         raise HTTPException(status_code=500, detail=f"verify_token crash: {e.__class__.__name__}: {e}")
 
+
 # ---------------- Webhook: plan change from WP ----------------
 @app.post("/webhook/payment-approved")
 async def webhook_payment_approved(request: Request, db: Session = Depends(get_db)):
-    # purge first so we don't reason with stale tokens
-    crud.purge_expired_tokens(db)
+    # Authenticate FIRST using HMAC header
+    raw = await request.body()
+    _verify_webhook(request.headers.get("x-webhook-signature"), raw)
+
+    # Also purge expired tokens before touching state
+    try:
+        purged = crud.purge_expired_tokens(db)
+        if purged:
+            db.commit()
+    except Exception:
+        db.rollback()
 
     try:
         # tolerant parsing (JSON/form/query)
-        body = await request.body()
         ct = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
         data = {}
         if ct == "application/json":
             try:
-                data = await request.json()
+                data = json.loads(raw.decode("utf-8") or "{}")
             except Exception:
                 data = {}
         else:
@@ -159,7 +191,7 @@ async def webhook_payment_approved(request: Request, db: Session = Depends(get_d
         if raw_uid not in (None, ""):
             try:
                 user_id = int(raw_uid)
-            except:
+            except Exception:
                 user_id = None
         username = (data.get("username") or data.get("user") or None)
         email    = (data.get("email") or None)
@@ -174,7 +206,7 @@ async def webhook_payment_approved(request: Request, db: Session = Depends(get_d
         # ensure user
         user = crud.ensure_user(db, user_id, username, email)
 
-        # Decide rotation: rotate if the effective plan is changing
+        # rotate iff effective plan changes
         active = db.query(models.APIToken).filter(
             models.APIToken.user_id == user.id,
             models.APIToken.is_active == True
@@ -206,6 +238,7 @@ async def webhook_payment_approved(request: Request, db: Session = Depends(get_d
         logging.exception("webhook_payment_approved crashed")
         raise HTTPException(status_code=500, detail=f"webhook crash: {e.__class__.__name__}: {e}")
 
+
 # ---------------- Admin: change plan (keep or rotate key) ----------------
 @app.post("/admin/plan", response_model=PlanChangeOut)
 def admin_change_plan(
@@ -214,8 +247,13 @@ def admin_change_plan(
     db: Session = Depends(get_db),
 ):
     _require_admin_bearer(authorization)
-    # purge first to avoid edge cases
-    crud.purge_expired_tokens(db)
+    # purge first
+    try:
+        purged = crud.purge_expired_tokens(db)
+        if purged:
+            db.commit()
+    except Exception:
+        db.rollback()
 
     try:
         user = crud.ensure_user(db, payload.user_id, payload.username, payload.email)
@@ -223,15 +261,15 @@ def admin_change_plan(
         token_obj, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
         limits = crud.plan_limits(token_obj.plan)
 
-        db.commit()  # persist!
+        db.commit()
 
-        # notify WP so the account page reflects the new plan/key
         notify_wordpress(user, token_obj)
 
         return {"ok": True, "user": user, "plan": token_obj.plan, "rotated": rotated, "api_key": token_obj.token, **limits}
     except:
         db.rollback()
         raise
+
 
 # ---------------- Admin: issue/rotate token (kept) ----------------
 @app.post("/admin/issue_token", response_model=AdminIssueTokenResponse)
@@ -241,22 +279,28 @@ def admin_issue_token(
     db: Session = Depends(get_db),
 ):
     _require_admin_bearer(authorization)
-    crud.purge_expired_tokens(db)
+    # purge first
+    try:
+        purged = crud.purge_expired_tokens(db)
+        if purged:
+            db.commit()
+    except Exception:
+        db.rollback()
 
     try:
         user = crud.ensure_user(db, payload.user_id, payload.username, payload.email)
         plan = _coerce_plan(payload.plan)
         tok, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
 
-        db.commit()  # persist!
+        db.commit()
 
-        # notify WP so the account page picks up the new key
         notify_wordpress(user, tok)
 
         return {"username": user.username, "email": user.email, "plan": tok.plan, "api_key": tok.token, "rotated": rotated}
     except:
         db.rollback()
         raise
+
 
 # ---------------- Signals: publish by sender ----------------
 @app.post("/signals/publish", response_model=TradeSignalOut)
@@ -265,7 +309,13 @@ def publish_signal(
     authorization: Optional[str] = Header(None, alias="Authorization"),
     db: Session = Depends(get_db),
 ):
-    crud.purge_expired_tokens(db)
+    # purge
+    try:
+        purged = crud.purge_expired_tokens(db)
+        if purged:
+            db.commit()
+    except Exception:
+        db.rollback()
 
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization")
@@ -273,6 +323,7 @@ def publish_signal(
     ok, sender, _ = crud.verify_token(db, token)
     if not ok or not sender:
         raise HTTPException(status_code=401, detail="Invalid token")
+
     sig = crud.create_signal(
         db, sender,
         symbol=payload.symbol, action=payload.action,
@@ -282,6 +333,7 @@ def publish_signal(
     db.commit()  # ensure signal is persisted
     return sig
 
+
 # ---------------- Signals: fetch latest for receiver (quota enforced) ----------------
 @app.get("/signals/latest", response_model=LatestSignalOut)
 def latest_signals(
@@ -289,7 +341,13 @@ def latest_signals(
     limit: int = Query(10, ge=1, le=50),
     db: Session = Depends(get_db),
 ):
-    crud.purge_expired_tokens(db)
+    # purge
+    try:
+        purged = crud.purge_expired_tokens(db)
+        if purged:
+            db.commit()
+    except Exception:
+        db.rollback()
 
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization")
@@ -318,6 +376,7 @@ def latest_signals(
     db.commit()  # persist read counters
     return {"items": signals}
 
+
 # ---------------- Trades: record (optional) ----------------
 @app.post("/trades/record", response_model=TradeRecordOut)
 def record_trade(
@@ -325,7 +384,13 @@ def record_trade(
     authorization: Optional[str] = Header(None, alias="Authorization"),
     db: Session = Depends(get_db),
 ):
-    crud.purge_expired_tokens(db)
+    # purge
+    try:
+        purged = crud.purge_expired_tokens(db)
+        if purged:
+            db.commit()
+    except Exception:
+        db.rollback()
 
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization")
@@ -337,6 +402,7 @@ def record_trade(
     db.commit()
     return tr
 
+
 # ---------------- Subscriptions (admin helper) ----------------
 @app.post("/admin/subscribe")
 def admin_subscribe(
@@ -346,7 +412,13 @@ def admin_subscribe(
     db: Session = Depends(get_db),
 ):
     _require_admin_bearer(authorization)
-    crud.purge_expired_tokens(db)
+    # purge
+    try:
+        purged = crud.purge_expired_tokens(db)
+        if purged:
+            db.commit()
+    except Exception:
+        db.rollback()
 
     try:
         r = db.query(models.User).filter(models.User.id == receiver_id).first()
@@ -367,6 +439,7 @@ def admin_subscribe(
     except:
         db.rollback()
         raise
+
 
 # ---------------- Activations list ----------------
 @app.get("/activations", response_model=ActivationsList)
