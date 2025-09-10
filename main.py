@@ -94,6 +94,7 @@ def verify_token(
         logging.exception("verify_token crashed")
         # Surface real cause instead of empty 500
         raise HTTPException(status_code=500, detail=f"verify_token crash: {e.__class__.__name__}: {e}")
+
 # ---------------- Webhook: plan change from WP ----------------
 @app.post("/webhook/payment-approved")
 async def webhook_payment_approved(request: Request, db: Session = Depends(get_db)):
@@ -173,6 +174,10 @@ def admin_change_plan(
     plan = _coerce_plan(payload.plan)
     token_obj, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
     limits = crud.plan_limits(token_obj.plan)
+
+    # NEW: push change back to WordPress (best-effort, non-blocking)
+    notify_wordpress(user, token_obj)
+
     return {"ok": True, "user": user, "plan": token_obj.plan, "rotated": rotated, "api_key": token_obj.token, **limits}
 
 # ---------------- Admin: issue/rotate token (kept) ----------------
@@ -186,6 +191,10 @@ def admin_issue_token(
     user = crud.ensure_user(db, payload.user_id, payload.username, payload.email)
     plan = _coerce_plan(payload.plan)
     tok, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
+
+    # NEW: push change back to WordPress
+    notify_wordpress(user, tok)
+
     return {"username": user.username, "email": user.email, "plan": tok.plan, "api_key": tok.token, "rotated": rotated}
 
 # ---------------- Signals: publish by sender ----------------
