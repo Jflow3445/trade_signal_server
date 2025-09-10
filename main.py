@@ -278,7 +278,25 @@ def admin_subscribe(
     return {"ok": True, "receiver_id": r.id, "sender_id": s.id}
 
 # ---------------- Activations list ----------------
-@app.get("/activations", response_model=ActivationsList)
-def activations(db: Session = Depends(get_db)):
+@app.get("/activations")
+def activations(
+    authorization: str | None = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db)
+):
+    admin_token = os.getenv("ADMIN_TOKEN") or os.getenv("ADMIN_SECRET")
+    is_admin = bool(admin_token) and (authorization == f"Bearer {admin_token}")
+
     users = db.query(models.User).filter(models.User.is_active == True).all()
-    return {"items": users}
+    items = []
+    for u in users:
+        row = {
+            "id": u.id,
+            "username": u.username,
+            "email": u.email,
+            "plan": u.plan,
+            "is_active": u.is_active,
+        }
+        if is_admin:
+            row["api_key"] = u.api_key
+        items.append(row)
+    return {"items": items}
