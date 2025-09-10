@@ -1,12 +1,11 @@
 import os
+import json
 import hmac
-import logging
+import hashlib
 from datetime import datetime, timezone
-from typing import List, Set, Dict, Any, Optional
-from collections.abc import Generator  # <-- for get_db type
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, Response, Query
+from typing import Optional, Dict, Any, List
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy.orm import Session
 from database import SessionLocal, engine, Base
 import models
@@ -14,233 +13,243 @@ import crud
 from schemas import (
     TradeSignalCreate, TradeSignalOut, LatestSignalOut,
     TradeRecordCreate, TradeRecordOut,
-    AdminIssueTokenRequest, AdminIssueTokenResponse,
-    ValidateRequest, ValidateResponse,
-    EASyncRequest, EASyncResponse,
-    ActivationsList,
+    PlanChangeIn, PlanChangeOut, VerifyOut, ActivationsList,
+    AdminIssueTokenRequest, AdminIssueTokenResponse, UserOut
 )
 
-# ----------------
-# App & CORS
-# ----------------
-app = FastAPI(title="Trade Signals API", version="1.0.0")
+APP_NAME = "Nister Trade Server"
 
-origins = ["*"]
+app = FastAPI(title=APP_NAME)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins, allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"]
+    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    max_age=3600,
 )
 
-# ----------------
-# DB dependency
-# ----------------
-def get_db() -> Generator[Session, None, None]:
+def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-# ----------------
-# Middleware: simple request logging
-# ----------------
-class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        try:
-            resp = await call_next(request)
-            return resp
-        except Exception as e:
-            logging.exception("Unhandled error")
-            raise
-
-app.add_middleware(LoggingMiddleware)
-
-# ----------------
-# Startup - create tables
-# ----------------
 @app.on_event("startup")
-def on_startup():
+def startup():
     Base.metadata.create_all(bind=engine)
 
-# ----------------
-# Health
-# ----------------
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
-# ----------------
-# Utility: extract bearer token
-# ----------------
-def require_bearer(auth: Optional[str]) -> str:
-    if not auth or not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-    return auth.split(" ", 1)[1].strip()
+# ---------------- Auth helpers ----------------
+def _coerce_plan(p: Optional[str]) -> str:
+    return crud.normalize_plan(p)
 
-# ----------------
-# Plan coercion:
-# Only "silver" or "gold" are considered paid plans.
-# Any other incoming plan string (including pending_* or typos) becomes "free".
-# ----------------
-def _coerce_plan(raw: Optional[str]) -> str:
-    p = (raw or "").strip().lower()
-    if p in ("silver", "gold"):
-        return p
-    return "free"
+def _require_admin_bearer(authorization: Optional[str]) -> None:
+    admin = os.getenv("ADMIN_TOKEN") or os.getenv("ADMIN_SECRET")
+    if not admin or not authorization or authorization != f"Bearer {admin}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-# ----------------
-# POST /signals  (sender posts)
-# ----------------
-@app.post("/signals", response_model=TradeSignalOut)
-def post_signal(
-    payload: TradeSignalCreate,
+def _verify_webhook(header_sig: Optional[str], payload: bytes) -> None:
+    secret = os.getenv("WEBHOOK_SECRET")
+    if not secret:
+        return
+    if not header_sig:
+        raise HTTPException(status_code=401, detail="Missing signature")
+    mac = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(mac, header_sig):
+        raise HTTPException(status_code=401, detail="Bad signature")
+
+# ---------------- Public: verify token ----------------
+@app.get("/auth/verify", response_model=VerifyOut)
+def verify_token(authorization: Optional[str] = Header(None, alias="Authorization"), db: Session = Depends(get_db)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization")
+    token = authorization.split(" ", 1)[1].strip()
+    ok, user, meta = crud.verify_token(db, token)
+    if not ok or not user:
+        raise HTTPException(status_code=401, detail="Invalid or inactive token")
+    return {"ok": True, "plan": meta.get("plan"), "daily_quota": meta.get("daily_quota"), "unlimited": meta.get("unlimited")}
+
+# ---------------- Webhook: plan change from WP ----------------
+@app.post("/webhook/payment-approved", response_model=PlanChangeOut)
+async def webhook_payment_approved(
+    request: Request,
+    x_signature: Optional[str] = Header(None, alias="X-Signature"),
     db: Session = Depends(get_db),
-    authorization: Optional[str] = Header(None, alias="Authorization")
 ):
-    token = require_bearer(authorization)
-    sender = crud.user_by_api_token(db, token)
-    if not sender or not sender.is_active:
-        raise HTTPException(status_code=401, detail="Invalid sender token")
-
-    sig = crud.create_signal(
-        db=db,
-        sender=sender,
-        symbol=payload.symbol,
-        action=payload.action,
-        sl_pips=payload.sl_pips,
-        tp_pips=payload.tp_pips,
-        lot_size=payload.lot_size,
-        details=payload.details
-    )
-    return sig
-
-# ----------------
-# GET /signals  (receiver pulls)
-# ----------------
-@app.get("/signals", response_model=List[TradeSignalOut])
-def get_signals(
-    db: Session = Depends(get_db),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-    response: Response = None,
-    limit: int = Query(50, ge=1, le=200)
-):
-    token = require_bearer(authorization)
+    payload = await request.body()
+    # Try HMAC
     try:
-        receiver, signals, meta = crud.latest_signals_for_token(db, token, limit=limit)
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid or inactive API token")
+        _verify_webhook(x_signature, payload)
+    except HTTPException:
+        # Legacy secret in body/query
+        data_probe: Dict[str, Any] = {}
+        try:
+            data_probe = json.loads(payload or b"{}")
+        except Exception:
+            pass
+        legacy_secret = (data_probe.get("secret") if isinstance(data_probe, dict) else None) or request.query_params.get("secret")
+        if not legacy_secret or legacy_secret != os.getenv("WEBHOOK_SECRET"):
+            raise
 
-    # Expose meta in headers
-    if response is not None and isinstance(meta, dict):
-        if meta.get("unlimited", False):
-            response.headers["X-Plan"] = "gold"
-            response.headers["X-Quota-Daily"] = "unlimited"
-            response.headers["X-Quota-Remaining"] = "unlimited"
-        else:
-            response.headers["X-Plan"] = str(meta.get("plan"))
-            response.headers["X-Quota-Daily"] = str(meta.get("daily_quota"))
-            response.headers["X-Quota-Remaining"] = str(meta.get("remaining"))
-        if "used_today" in meta:
-            response.headers["X-Used-Today"] = str(meta["used_today"])
-        if "token_used_today" in meta:
-            response.headers["X-Token-Used-Today"] = str(meta["token_used_today"])
+    # Parse JSON or form/query
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    data: Dict[str, Any] = {}
+    if content_type == "application/json":
+        try:
+            data = json.loads(payload or b"{}")
+        except Exception:
+            data = {}
+    else:
+        data = dict(request.query_params)
+        # naive body parse for x-www-form-urlencoded without starlette's parser
+        if not data and payload:
+            try:
+                kv = payload.decode()
+                for pair in kv.split("&"):
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        data.setdefault(k, v)
+            except Exception:
+                pass
 
-    return signals
+    user_id = int(data.get("user_id") or 0) or None
+    username = data.get("username")
+    email = data.get("email")
+    plan_raw = data.get("plan") or data.get("tier") or data.get("subscription") or "free"
+    rotate = str(data.get("rotate", "false")).lower() in ("1", "true", "yes")
 
-# ----------------
-# POST /records  (receiver posts trade execution, optional)
-# ----------------
-@app.post("/records", response_model=TradeRecordOut)
-def post_record(
-    payload: TradeRecordCreate,
+    plan = _coerce_plan(plan_raw)  # pending_* or junk -> free
+
+    user = crud.ensure_user(db, user_id, username, email)
+    token_obj, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=rotate)
+    limits = crud.plan_limits(token_obj.plan)
+
+    return {"ok": True, "user": user, "plan": token_obj.plan, "rotated": rotated, "api_key": token_obj.token, **limits}
+
+# ---------------- Admin: change plan (keep or rotate key) ----------------
+@app.post("/admin/plan", response_model=PlanChangeOut)
+def admin_change_plan(
+    payload: PlanChangeIn,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
     db: Session = Depends(get_db),
-    authorization: Optional[str] = Header(None, alias="Authorization")
 ):
-    token = require_bearer(authorization)
-    receiver = crud.user_by_api_token(db, token)
-    if not receiver or not receiver.is_active:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    _require_admin_bearer(authorization)
+    user = crud.ensure_user(db, payload.user_id, payload.username, payload.email)
+    plan = _coerce_plan(payload.plan)
+    token_obj, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
+    limits = crud.plan_limits(token_obj.plan)
+    return {"ok": True, "user": user, "plan": token_obj.plan, "rotated": rotated, "api_key": token_obj.token, **limits}
 
-    rec = crud.create_trade_record(db, receiver, action=payload.action, symbol=payload.symbol, details=payload.details)
-    return rec
-
-# ----------------
-# POST /validate (email + api_key)
-# ----------------
-@app.post("/validate", response_model=ValidateResponse)
-def validate(payload: ValidateRequest, db: Session = Depends(get_db)):
-    ok, user, info = crud.validate_email_token(db, payload.email, payload.api_key)
-    if not ok:
-        return {
-            "ok": False,
-            "is_active": False,
-            "plan": None,
-            "daily_quota": None,
-            "expires_at": None
-        }
-    return {
-        "ok": True,
-        "is_active": True,
-        "plan": info.get("plan"),
-        "daily_quota": info.get("daily_quota"),
-        "expires_at": info.get("expires_at")
-    }
-
-# ----------------
-# Admin: issue/upgrade a token to a plan (helper)
-# NOTE: plan is coerced so only "silver"/"gold" are honored; everything else => "free"
-# ----------------
+# ---------------- Admin: issue/rotate token (kept) ----------------
 @app.post("/admin/issue_token", response_model=AdminIssueTokenResponse)
 def admin_issue_token(
     payload: AdminIssueTokenRequest,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
     db: Session = Depends(get_db),
-    x_admin_secret: Optional[str] = Header(None, alias="X-Admin-Secret")
 ):
-    # very simple guard
-    admin_secret = os.getenv("ADMIN_SECRET", "")
-    if not admin_secret or x_admin_secret != admin_secret:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    _require_admin_bearer(authorization)
+    user = crud.ensure_user(db, payload.user_id, payload.username, payload.email)
+    plan = _coerce_plan(payload.plan)
+    tok, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
+    return {"username": user.username, "email": user.email, "plan": tok.plan, "api_key": tok.token, "rotated": rotated}
 
-    # enforce strict plan handling
-    safe_plan = _coerce_plan(payload.plan)
+# ---------------- Signals: publish by sender ----------------
+@app.post("/signals/publish", response_model=TradeSignalOut)
+def publish_signal(
+    payload: TradeSignalCreate,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization")
+    token = authorization.split(" ", 1)[1].strip()
+    ok, sender, _ = crud.verify_token(db, token)
+    if not ok or not sender:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    sig = crud.create_signal(
+        db, sender,
+        symbol=payload.symbol, action=payload.action,
+        sl_pips=payload.sl_pips, tp_pips=payload.tp_pips,
+        lot_size=payload.lot_size, details=payload.details
+    )
+    return sig
 
-    try:
-        user, tok = crud.admin_issue_token(db, payload.username_or_email, payload.token, safe_plan)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+# ---------------- Signals: fetch latest for receiver (quota enforced) ----------------
+@app.get("/signals/latest", response_model=LatestSignalOut)
+def latest_signals(
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db),
+):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization")
+    token = authorization.split(" ", 1)[1].strip()
+    ok, receiver, meta = crud.verify_token(db, token)
+    if not ok or not receiver:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-    return {
-        "username": user.username,
-        "email": user.email,
-        "token": tok.token,
-        "plan": tok.plan,        # this will reflect the coerced plan stored
-        "is_active": tok.is_active
-    }
+    # Enforce quotas
+    unlimited = bool(meta.get("unlimited"))
+    daily_quota = meta.get("daily_quota")
+    token_hash = crud.hash_token_for_read(token)
 
-# ----------------
-# EA sync (optional endpoint your EA might call after login)
-# ----------------
-@app.post("/ea_sync", response_model=EASyncResponse)
-def ea_sync(payload: EASyncRequest, db: Session = Depends(get_db)):
-    ok, user, info = crud.validate_email_token(db, payload.email, payload.api_key)
-    return {
-        "ok": ok,
-        "plan": info.get("plan") if ok else None,
-        "daily_quota": info.get("daily_quota") if ok else None,
-        "unlimited": info.get("unlimited") if ok else None
-    }
+    if not unlimited:
+        used = crud.count_reads_today(db, receiver, token_hash=token_hash)
+        remaining = max(0, int(daily_quota) - used) if daily_quota is not None else 0
+        if remaining <= 0:
+            return {"items": []}
+        limit = min(limit, remaining)
 
-# ----------------
-# Activations list (optional)
-# ----------------
+    signals = crud.get_latest_signals_for_receiver(db, receiver, limit=limit)
+    # Record reads
+    for s in signals:
+        crud.record_signal_read(db, s.id, receiver, token_hash)
+    return {"items": signals}
+
+# ---------------- Trades: record (optional) ----------------
+@app.post("/trades/record", response_model=TradeRecordOut)
+def record_trade(
+    payload: TradeRecordCreate,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization")
+    token = authorization.split(" ", 1)[1].strip()
+    ok, receiver, _ = crud.verify_token(db, token)
+    if not ok or not receiver:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    tr = crud.record_trade(db, receiver, payload.symbol, payload.action, payload.details)
+    return tr
+
+# ---------------- Subscriptions (admin helper) ----------------
+@app.post("/admin/subscribe")
+def admin_subscribe(
+    receiver_id: int,
+    sender_id: int,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    _require_admin_bearer(authorization)
+    r = db.query(models.User).filter(models.User.id == receiver_id).first()
+    s = db.query(models.User).filter(models.User.id == sender_id).first()
+    if not r or not s:
+        raise HTTPException(status_code=404, detail="User not found")
+    # upsert
+    exists = db.query(models.Subscription).filter(models.Subscription.receiver_id == r.id, models.Subscription.sender_id == s.id).first()
+    if not exists:
+        db.add(models.Subscription(receiver_id=r.id, sender_id=s.id))
+        db.flush()
+    return {"ok": True, "receiver_id": r.id, "sender_id": s.id}
+
+# ---------------- Activations list ----------------
 @app.get("/activations", response_model=ActivationsList)
 def activations(db: Session = Depends(get_db)):
-    items = []
-    for u in db.query(models.User).filter(models.User.is_active == True).all():
-        items.append({
-            "username": u.username,
-            "email": u.email,
-            "plan": u.plan
-        })
-    return {"items": items}
+    users = db.query(models.User).filter(models.User.is_active == True).all()
+    return {"items": users}

@@ -2,7 +2,7 @@ from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from datetime import datetime
 
-# -------- Trade Signal --------
+# ---- Signals ----
 class TradeSignalCreate(BaseModel):
     symbol: str
     action: str
@@ -17,73 +17,77 @@ class TradeSignalOut(BaseModel):
     action: str
     sl_pips: Optional[int] = None
     tp_pips: Optional[int] = None
-    lot_size: Optional[float] = None
+    lot_size: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
     created_at: datetime
-
     class Config:
         from_attributes = True
 
 class LatestSignalOut(BaseModel):
-    signals: List[TradeSignalOut]
+    items: List[TradeSignalOut] = Field(default_factory=list)
 
-# -------- Trade Record --------
+# ---- Trade records ----
 class TradeRecordCreate(BaseModel):
-    action: str
     symbol: str
+    action: str
     details: Optional[Dict[str, Any]] = None
 
 class TradeRecordOut(BaseModel):
     id: int
-    action: str
     symbol: str
+    action: str
     details: Optional[Dict[str, Any]] = None
     created_at: datetime
-
     class Config:
         from_attributes = True
 
-# -------- Admin --------
-class AdminIssueTokenRequest(BaseModel):
-    username_or_email: str
-    token: str
-    plan: str
-
-class AdminIssueTokenResponse(BaseModel):
+# ---- Admin/user ----
+class UserOut(BaseModel):
+    id: int
     username: str
-    email: Optional[str]
-    token: str
+    email: Optional[str] = None
     plan: str
+    api_key: Optional[str] = None
     is_active: bool
+    class Config:
+        from_attributes = True
 
-# -------- Validate --------
-class ValidateRequest(BaseModel):
-    email: str
-    api_key: str
+class PlanChangeIn(BaseModel):
+    user_id: Optional[int] = None
+    username: Optional[str] = None
+    email: Optional[str] = None
+    plan: str
+    rotate: Optional[bool] = False
 
-class ValidateResponse(BaseModel):
+class PlanChangeOut(BaseModel):
     ok: bool
-    is_active: Optional[bool] = None
-    plan: Optional[str] = None
-    daily_quota: Optional[int] = None
-    expires_at: Optional[datetime] = None
-
-# -------- EA sync --------
-class EASyncRequest(BaseModel):
-    email: str
+    user: UserOut
+    plan: str
+    rotated: bool
     api_key: str
+    daily_quota: Optional[int] = None
+    unlimited: Optional[bool] = None
 
-class EASyncResponse(BaseModel):
+class VerifyOut(BaseModel):
     ok: bool
     plan: Optional[str] = None
     daily_quota: Optional[int] = None
     unlimited: Optional[bool] = None
 
-# -------- Activations --------
-class ActivationItem(BaseModel):
+class ActivationsList(BaseModel):
+    items: List[UserOut] = Field(default_factory=list)
+
+# ---- Admin issue token (kept from existing server behaviour) ----
+class AdminIssueTokenRequest(BaseModel):
+    username: Optional[str] = None
+    email: Optional[str] = None
+    user_id: Optional[int] = None
+    plan: str = "free"
+    rotate: bool = True
+
+class AdminIssueTokenResponse(BaseModel):
     username: str
     email: Optional[str] = None
-    plan: Optional[str] = None
-
-class ActivationsList(BaseModel):
-    items: List[ActivationItem] = Field(default_factory=list)
+    plan: str
+    api_key: str
+    rotated: bool
