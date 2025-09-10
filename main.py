@@ -98,7 +98,7 @@ def verify_token(
 @app.post("/webhook/payment-approved")
 async def webhook_payment_approved(request: Request, db: Session = Depends(get_db)):
     try:
-        # Parse payload safely
+        # tolerant parsing (JSON/form/query)
         body = await request.body()
         ct = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
         data = {}
@@ -114,33 +114,37 @@ async def webhook_payment_approved(request: Request, db: Session = Depends(get_d
             except Exception:
                 data = {}
         if not data:
-            # allow query fallback
             data = dict(request.query_params)
 
-        # Accept identity via user_id or username or email
+        # identity
         raw_uid = data.get("user_id")
         user_id = None
         if raw_uid not in (None, ""):
-            try:
-                user_id = int(raw_uid)
-            except Exception:
-                user_id = None
+            try: user_id = int(raw_uid)
+            except: user_id = None
         username = (data.get("username") or data.get("user") or None)
-        email = (data.get("email") or None)
-
+        email    = (data.get("email") or None)
         if not (user_id or username or email):
             raise HTTPException(status_code=400, detail="Need one of user_id, username, or email")
 
-        # Plan
+        # plan
         plan = (data.get("plan") or data.get("tier") or data.get("subscription") or "").strip().lower()
         if plan not in ("free", "silver", "gold"):
             plan = "free"
 
-        # Upsert & update the ACTIVE token's plan, no rotation
+        # ensure user
         user = crud.ensure_user(db, user_id, username, email)
-        tok, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=False)
-        limits = crud.plan_limits(plan)
 
+        # Decide rotation: rotate if the effective plan is changing
+        # (compute current effective plan from active token if present; else from user.plan)
+        active = db.query(models.APIToken).filter(models.APIToken.user_id == user.id, models.APIToken.is_active == True).first()
+        current_plan = crud.normalize_plan(active.plan if active else user.plan)
+        need_rotate = (crud.normalize_plan(plan) != current_plan)
+
+        tok, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=need_rotate)
+        limits = crud.plan_limits(tok.plan)
+
+        db.commit()  # persist rotation and plan update
         return {
             "ok": True,
             "user": {"id": user.id, "username": user.username, "email": user.email, "plan": tok.plan},
@@ -149,10 +153,11 @@ async def webhook_payment_approved(request: Request, db: Session = Depends(get_d
             "api_key": tok.token,
             **limits
         }
-
     except HTTPException:
+        db.rollback()
         raise
     except Exception as e:
+        db.rollback()
         logging.exception("webhook_payment_approved crashed")
         raise HTTPException(status_code=500, detail=f"webhook crash: {e.__class__.__name__}: {e}")
 

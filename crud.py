@@ -59,14 +59,22 @@ def generate_token() -> str:
     return secrets.token_urlsafe(32)
 
 def upsert_active_token(db: Session, user: User, plan: Optional[str] = None, rotate: bool = False) -> Tuple[APIToken, bool]:
-    """Keep exactly one active token per user. Mirror user.api_key for legacy clients."""
+    """
+    Keep exactly one active token per user.
+    - Rotate if explicit OR if plan actually changes.
+    - Deactivate all prior tokens when rotating.
+    - Mirror user.api_key to the active token for legacy clients.
+    """
     plan_norm = normalize_plan(plan or user.plan)
     active = db.query(APIToken).filter(APIToken.user_id == user.id, APIToken.is_active == True).first()
     rotated = False
+
     if active:
-        if rotate or normalize_plan(active.plan) != plan_norm:
-            # deactivate existing tokens, issue new
-            db.query(APIToken).filter(APIToken.user_id == user.id, APIToken.is_active == True).update({APIToken.is_active: False})
+        plan_changed = normalize_plan(active.plan) != plan_norm
+        if rotate or plan_changed:
+            # hard rotate: invalidate all active tokens, issue new one with new plan
+            db.query(APIToken).filter(APIToken.user_id == user.id, APIToken.is_active == True)\
+                              .update({APIToken.is_active: False})
             new_tok = APIToken(user_id=user.id, token=generate_token(), plan=plan_norm, is_active=True, created_at=utc_now())
             db.add(new_tok)
             user.api_key = new_tok.token
@@ -75,7 +83,7 @@ def upsert_active_token(db: Session, user: User, plan: Optional[str] = None, rot
             db.flush()
             return new_tok, True
         else:
-            # keep existing token; just update plan if needed
+            # no plan change: keep token, just ensure stored plan is consistent
             if active.plan != plan_norm:
                 active.plan = plan_norm
             user.api_key = active.token
@@ -83,7 +91,8 @@ def upsert_active_token(db: Session, user: User, plan: Optional[str] = None, rot
             user.updated_at = utc_now()
             db.flush()
             return active, False
-    # no active token -> create one
+
+    # no active token exists -> create a fresh one (counts as rotation)
     new_tok = APIToken(user_id=user.id, token=generate_token(), plan=plan_norm, is_active=True, created_at=utc_now())
     db.add(new_tok)
     user.api_key = new_tok.token
@@ -91,6 +100,7 @@ def upsert_active_token(db: Session, user: User, plan: Optional[str] = None, rot
     user.updated_at = utc_now()
     db.flush()
     return new_tok, True
+
 
 def verify_token(db: Session, api_key: str) -> Tuple[bool, Optional[User], Dict[str, Any]]:
     # Prefer token row
