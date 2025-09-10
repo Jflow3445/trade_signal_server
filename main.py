@@ -41,6 +41,15 @@ def get_db():
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
+    # Purge any expired tokens at boot
+    try:
+        db = SessionLocal()
+        crud.purge_expired_tokens(db)
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 @app.get("/health")
 def health():
@@ -51,7 +60,8 @@ def _coerce_plan(p: Optional[str]) -> str:
     return crud.normalize_plan(p)
 
 def _require_admin_bearer(authorization: Optional[str]) -> None:
-    admin = os.getenv("ADMIN_TOKEN") or os.getenv("ADMIN_SECRET")
+    # allow ADMIN_TOKEN, ADMIN_SECRET, or ADMIN_KEY for compatibility
+    admin = os.getenv("ADMIN_TOKEN") or os.getenv("ADMIN_SECRET") or os.getenv("ADMIN_KEY")
     if not admin or not authorization or authorization != f"Bearer {admin}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -92,6 +102,9 @@ def verify_token(
     authorization: str | None = Header(None, alias="Authorization"),
     db: Session = Depends(get_db),
 ):
+    # opportunistic purge to keep the table clean
+    crud.purge_expired_tokens(db)
+
     try:
         if not authorization or not authorization.lower().startswith("bearer "):
             raise HTTPException(status_code=401, detail="Missing Authorization")
@@ -113,12 +126,14 @@ def verify_token(
         raise
     except Exception as e:
         logging.exception("verify_token crashed")
-        # Surface real cause instead of empty 500
         raise HTTPException(status_code=500, detail=f"verify_token crash: {e.__class__.__name__}: {e}")
 
 # ---------------- Webhook: plan change from WP ----------------
 @app.post("/webhook/payment-approved")
 async def webhook_payment_approved(request: Request, db: Session = Depends(get_db)):
+    # purge first so we don't reason with stale tokens
+    crud.purge_expired_tokens(db)
+
     try:
         # tolerant parsing (JSON/form/query)
         body = await request.body()
@@ -142,8 +157,10 @@ async def webhook_payment_approved(request: Request, db: Session = Depends(get_d
         raw_uid = data.get("user_id")
         user_id = None
         if raw_uid not in (None, ""):
-            try: user_id = int(raw_uid)
-            except: user_id = None
+            try:
+                user_id = int(raw_uid)
+            except:
+                user_id = None
         username = (data.get("username") or data.get("user") or None)
         email    = (data.get("email") or None)
         if not (user_id or username or email):
@@ -197,13 +214,16 @@ def admin_change_plan(
     db: Session = Depends(get_db),
 ):
     _require_admin_bearer(authorization)
+    # purge first to avoid edge cases
+    crud.purge_expired_tokens(db)
+
     try:
         user = crud.ensure_user(db, payload.user_id, payload.username, payload.email)
         plan = _coerce_plan(payload.plan)
         token_obj, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
         limits = crud.plan_limits(token_obj.plan)
 
-        db.commit()  # <-- critical: persist!
+        db.commit()  # persist!
 
         # notify WP so the account page reflects the new plan/key
         notify_wordpress(user, token_obj)
@@ -221,12 +241,14 @@ def admin_issue_token(
     db: Session = Depends(get_db),
 ):
     _require_admin_bearer(authorization)
+    crud.purge_expired_tokens(db)
+
     try:
         user = crud.ensure_user(db, payload.user_id, payload.username, payload.email)
         plan = _coerce_plan(payload.plan)
         tok, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
 
-        db.commit()  # <-- persist!
+        db.commit()  # persist!
 
         # notify WP so the account page picks up the new key
         notify_wordpress(user, tok)
@@ -243,6 +265,8 @@ def publish_signal(
     authorization: Optional[str] = Header(None, alias="Authorization"),
     db: Session = Depends(get_db),
 ):
+    crud.purge_expired_tokens(db)
+
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization")
     token = authorization.split(" ", 1)[1].strip()
@@ -265,6 +289,8 @@ def latest_signals(
     limit: int = Query(10, ge=1, le=50),
     db: Session = Depends(get_db),
 ):
+    crud.purge_expired_tokens(db)
+
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization")
     token = authorization.split(" ", 1)[1].strip()
@@ -299,6 +325,8 @@ def record_trade(
     authorization: Optional[str] = Header(None, alias="Authorization"),
     db: Session = Depends(get_db),
 ):
+    crud.purge_expired_tokens(db)
+
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization")
     token = authorization.split(" ", 1)[1].strip()
@@ -318,6 +346,8 @@ def admin_subscribe(
     db: Session = Depends(get_db),
 ):
     _require_admin_bearer(authorization)
+    crud.purge_expired_tokens(db)
+
     try:
         r = db.query(models.User).filter(models.User.id == receiver_id).first()
         s = db.query(models.User).filter(models.User.id == sender_id).first()

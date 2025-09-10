@@ -3,7 +3,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_
+from sqlalchemy import func
 from models import User, APIToken, TradeSignal, Subscription, SignalRead, TradeRecord
 
 # ---------- Plans & quotas ----------
@@ -15,7 +15,10 @@ PLAN_DEFAULTS = {
 
 # ---------- Helpers ----------
 def utc_now() -> datetime:
+    # store naive UTC to match default datetime.utcnow columns
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+MONTH = timedelta(days=30)
 
 def start_of_utc_day(ts: Optional[datetime] = None) -> datetime:
     ts = ts or utc_now()
@@ -51,8 +54,16 @@ def ensure_user(db: Session, user_id: Optional[int], username: Optional[str], em
     name = username or (email.split("@")[0] if email else None)
     if not name:
         raise ValueError("username or email required")
-    u = User(username=name, email=email, plan="free", is_active=True, created_at=utc_now(), updated_at=utc_now())
-    db.add(u); db.flush()
+    u = User(
+        username=name,
+        email=email,
+        plan="free",
+        is_active=True,
+        created_at=utc_now(),
+        updated_at=utc_now()
+    )
+    db.add(u)
+    db.flush()
     return u
 
 def generate_token() -> str:
@@ -60,30 +71,28 @@ def generate_token() -> str:
 
 def upsert_active_token(db: Session, user: User, plan: Optional[str] = None, rotate: bool = False) -> Tuple[APIToken, bool]:
     """
-    Keep exactly one active token per user.
-    - Rotate if explicit OR if plan actually changes.
-    - Deactivate all prior tokens when rotating.
-    - Mirror user.api_key to the active token for legacy clients.
+    Strict model:
+      * Exactly one active token per user.
+      * Rotate (delete all existing tokens) if plan changes or rotate=True.
+      * New token gets 30-day hard expiry.
+      * Mirror user.api_key for legacy display only (not used for auth).
     """
     plan_norm = normalize_plan(plan or user.plan)
-    active = db.query(APIToken).filter(APIToken.user_id == user.id, APIToken.is_active == True).first()
+    active = db.query(APIToken).filter(
+        APIToken.user_id == user.id,
+        APIToken.is_active == True
+    ).first()
     rotated = False
 
     if active:
         plan_changed = normalize_plan(active.plan) != plan_norm
         if rotate or plan_changed:
-            # hard rotate: invalidate all active tokens, issue new one with new plan
-            db.query(APIToken).filter(APIToken.user_id == user.id, APIToken.is_active == True)\
-                              .update({APIToken.is_active: False})
-            new_tok = APIToken(user_id=user.id, token=generate_token(), plan=plan_norm, is_active=True, created_at=utc_now())
-            db.add(new_tok)
-            user.api_key = new_tok.token
-            user.plan = plan_norm
-            user.updated_at = utc_now()
-            db.flush()
-            return new_tok, True
+            # HARD ROTATE: delete all prior tokens (strict)
+            db.query(APIToken).filter(APIToken.user_id == user.id).delete(synchronize_session=False)
+            rotated = True
+            active = None
         else:
-            # no plan change: keep token, just ensure stored plan is consistent
+            # keep existing token, just sync plan if drifted
             if active.plan != plan_norm:
                 active.plan = plan_norm
             user.api_key = active.token
@@ -92,37 +101,86 @@ def upsert_active_token(db: Session, user: User, plan: Optional[str] = None, rot
             db.flush()
             return active, False
 
-    # no active token exists -> create a fresh one (counts as rotation)
-    new_tok = APIToken(user_id=user.id, token=generate_token(), plan=plan_norm, is_active=True, created_at=utc_now())
-    db.add(new_tok)
-    user.api_key = new_tok.token
-    user.plan = plan_norm
-    user.updated_at = utc_now()
-    db.flush()
-    return new_tok, True
-
+    if not active:
+        now = utc_now()
+        new_tok = APIToken(
+            user_id=user.id,
+            token=generate_token(),
+            plan=plan_norm,
+            is_active=True,
+            created_at=now,
+            expires_at=now + MONTH,
+        )
+        db.add(new_tok)
+        user.api_key = new_tok.token
+        user.plan = plan_norm
+        user.updated_at = now
+        db.flush()
+        return new_tok, rotated or True
 
 def verify_token(db: Session, api_key: str) -> Tuple[bool, Optional[User], Dict[str, Any]]:
-    # Prefer token row
-    tok = db.query(APIToken).filter(APIToken.token == api_key, APIToken.is_active == True).first()
+    """
+    Auth is only valid if there is a live APIToken row:
+      - token match
+      - is_active = True
+      - expires_at > now
+      - user.is_active = True
+    No legacy fallback to User.api_key for auth (prevents expired token use).
+    """
+    now = utc_now()
+    tok = db.query(APIToken).filter(
+        APIToken.token == api_key,
+        APIToken.is_active == True,
+        APIToken.expires_at > now
+    ).first()
     if tok and tok.user and tok.user.is_active:
         limits = plan_limits(tok.plan)
         return True, tok.user, {"plan": tok.plan, **limits}
-    # Fallback legacy
-    u = db.query(User).filter(User.api_key == api_key, User.is_active == True).first()
-    if u:
-        limits = plan_limits(u.plan)
-        return True, u, {"plan": u.plan, **limits}
-    return False, None, {"reason": "invalid_token"}
+    return False, None, {"reason": "invalid_or_expired_token"}
+
+def purge_expired_tokens(db: Session) -> int:
+    """
+    Delete all tokens whose expires_at <= now.
+    If a user ends up with no active token, downgrade to free and clear legacy api_key.
+    Returns the number of tokens deleted.
+    """
+    now = utc_now()
+    expired = db.query(APIToken).filter(APIToken.expires_at <= now).all()
+    if not expired:
+        return 0
+    affected_user_ids = {t.user_id for t in expired}
+    for t in expired:
+        db.delete(t)
+    db.flush()
+
+    # For any affected user without an active (non-expired) token, reset plan/api_key
+    for uid in affected_user_ids:
+        has_active = db.query(APIToken).filter(
+            APIToken.user_id == uid,
+            APIToken.is_active == True,
+            APIToken.expires_at > now
+        ).first()
+        if not has_active:
+            u = db.query(User).filter(User.id == uid).first()
+            if u:
+                u.plan = "free"
+                u.api_key = None
+                u.updated_at = now
+    return len(expired)
 
 # ---------- Signals ----------
-def create_signal(db: Session, sender: User, symbol: str, action: str, sl_pips=None, tp_pips=None, lot_size=None, details=None) -> TradeSignal:
+def create_signal(
+    db: Session, sender: User, symbol: str, action: str,
+    sl_pips=None, tp_pips=None, lot_size=None, details=None
+) -> TradeSignal:
     sig = TradeSignal(
         user_id=sender.id, symbol=symbol, action=action,
-        sl_pips=sl_pips, tp_pips=tp_pips, lot_size=str(lot_size) if lot_size is not None else None,
+        sl_pips=sl_pips, tp_pips=tp_pips,
+        lot_size=str(lot_size) if lot_size is not None else None,
         details=details or {}, created_at=utc_now()
     )
-    db.add(sig); db.flush()
+    db.add(sig)
+    db.flush()
     return sig
 
 def get_latest_signals_for_receiver(db: Session, receiver: User, limit: int = 20) -> List[TradeSignal]:
@@ -131,7 +189,9 @@ def get_latest_signals_for_receiver(db: Session, receiver: User, limit: int = 20
     if not subs:
         return []
     sender_ids = [s.sender_id for s in subs]
-    q = db.query(TradeSignal).filter(TradeSignal.user_id.in_(sender_ids)).order_by(TradeSignal.id.desc()).limit(limit)
+    q = db.query(TradeSignal).filter(
+        TradeSignal.user_id.in_(sender_ids)
+    ).order_by(TradeSignal.id.desc()).limit(limit)
     return list(reversed(q.all()))  # ascending delivery
 
 def count_reads_today(db: Session, receiver: User, token_hash: Optional[str] = None) -> int:
@@ -156,5 +216,6 @@ def record_signal_read(db: Session, signal_id: int, receiver: User, token_hash: 
 # ---------- Trades ----------
 def record_trade(db: Session, receiver: User, symbol: str, action: str, details=None) -> TradeRecord:
     tr = TradeRecord(user_id=receiver.id, action=action, symbol=symbol, details=details or {}, created_at=utc_now())
-    db.add(tr); db.flush()
+    db.add(tr)
+    db.flush()
     return tr
