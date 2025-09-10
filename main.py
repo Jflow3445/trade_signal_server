@@ -65,6 +65,27 @@ def _verify_webhook(header_sig: Optional[str], payload: bytes) -> None:
     if not hmac.compare_digest(mac, header_sig):
         raise HTTPException(status_code=401, detail="Bad signature")
 
+def notify_wordpress(user, token):
+    """
+    Optional server -> WP callback.
+    Env needed on this server:
+      WP_CALLBACK_URL=https://nister.org/wp-json/nister/v1/trade-callback
+      WP_CALLBACK_KEY=<same hex set as NISTER_TRADE_CALLBACK_KEY in wp-config.php>
+    """
+    url = os.getenv("WP_CALLBACK_URL")
+    key = os.getenv("WP_CALLBACK_KEY")
+    if not url or not key:
+        return
+    try:
+        requests.post(
+            url,
+            json={"username": user.username, "email": user.email, "plan": token.plan, "api_key": token.token},
+            headers={"X-Callback-Key": key},
+            timeout=3,  # short to avoid tying up request threads
+        )
+    except Exception as e:
+        logging.warning("WP callback failed: %s", e)
+
 # ---------------- Public: verify token ----------------
 @app.get("/auth/verify")
 def verify_token(
@@ -137,8 +158,10 @@ async def webhook_payment_approved(request: Request, db: Session = Depends(get_d
         user = crud.ensure_user(db, user_id, username, email)
 
         # Decide rotation: rotate if the effective plan is changing
-        # (compute current effective plan from active token if present; else from user.plan)
-        active = db.query(models.APIToken).filter(models.APIToken.user_id == user.id, models.APIToken.is_active == True).first()
+        active = db.query(models.APIToken).filter(
+            models.APIToken.user_id == user.id,
+            models.APIToken.is_active == True
+        ).first()
         current_plan = crud.normalize_plan(active.plan if active else user.plan)
         need_rotate = (crud.normalize_plan(plan) != current_plan)
 
@@ -146,6 +169,10 @@ async def webhook_payment_approved(request: Request, db: Session = Depends(get_d
         limits = crud.plan_limits(tok.plan)
 
         db.commit()  # persist rotation and plan update
+
+        # notify WP (optional; non-blocking with short timeout)
+        notify_wordpress(user, tok)
+
         return {
             "ok": True,
             "user": {"id": user.id, "username": user.username, "email": user.email, "plan": tok.plan},
@@ -170,15 +197,21 @@ def admin_change_plan(
     db: Session = Depends(get_db),
 ):
     _require_admin_bearer(authorization)
-    user = crud.ensure_user(db, payload.user_id, payload.username, payload.email)
-    plan = _coerce_plan(payload.plan)
-    token_obj, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
-    limits = crud.plan_limits(token_obj.plan)
+    try:
+        user = crud.ensure_user(db, payload.user_id, payload.username, payload.email)
+        plan = _coerce_plan(payload.plan)
+        token_obj, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
+        limits = crud.plan_limits(token_obj.plan)
 
-    # NEW: push change back to WordPress (best-effort, non-blocking)
-    notify_wordpress(user, token_obj)
+        db.commit()  # <-- critical: persist!
 
-    return {"ok": True, "user": user, "plan": token_obj.plan, "rotated": rotated, "api_key": token_obj.token, **limits}
+        # notify WP so the account page reflects the new plan/key
+        notify_wordpress(user, token_obj)
+
+        return {"ok": True, "user": user, "plan": token_obj.plan, "rotated": rotated, "api_key": token_obj.token, **limits}
+    except:
+        db.rollback()
+        raise
 
 # ---------------- Admin: issue/rotate token (kept) ----------------
 @app.post("/admin/issue_token", response_model=AdminIssueTokenResponse)
@@ -188,14 +221,20 @@ def admin_issue_token(
     db: Session = Depends(get_db),
 ):
     _require_admin_bearer(authorization)
-    user = crud.ensure_user(db, payload.user_id, payload.username, payload.email)
-    plan = _coerce_plan(payload.plan)
-    tok, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
+    try:
+        user = crud.ensure_user(db, payload.user_id, payload.username, payload.email)
+        plan = _coerce_plan(payload.plan)
+        tok, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
 
-    # NEW: push change back to WordPress
-    notify_wordpress(user, tok)
+        db.commit()  # <-- persist!
 
-    return {"username": user.username, "email": user.email, "plan": tok.plan, "api_key": tok.token, "rotated": rotated}
+        # notify WP so the account page picks up the new key
+        notify_wordpress(user, tok)
+
+        return {"username": user.username, "email": user.email, "plan": tok.plan, "api_key": tok.token, "rotated": rotated}
+    except:
+        db.rollback()
+        raise
 
 # ---------------- Signals: publish by sender ----------------
 @app.post("/signals/publish", response_model=TradeSignalOut)
@@ -216,6 +255,7 @@ def publish_signal(
         sl_pips=payload.sl_pips, tp_pips=payload.tp_pips,
         lot_size=payload.lot_size, details=payload.details
     )
+    db.commit()  # ensure signal is persisted
     return sig
 
 # ---------------- Signals: fetch latest for receiver (quota enforced) ----------------
@@ -248,6 +288,8 @@ def latest_signals(
     # Record reads
     for s in signals:
         crud.record_signal_read(db, s.id, receiver, token_hash)
+
+    db.commit()  # persist read counters
     return {"items": signals}
 
 # ---------------- Trades: record (optional) ----------------
@@ -264,6 +306,7 @@ def record_trade(
     if not ok or not receiver:
         raise HTTPException(status_code=401, detail="Invalid token")
     tr = crud.record_trade(db, receiver, payload.symbol, payload.action, payload.details)
+    db.commit()
     return tr
 
 # ---------------- Subscriptions (admin helper) ----------------
@@ -275,34 +318,28 @@ def admin_subscribe(
     db: Session = Depends(get_db),
 ):
     _require_admin_bearer(authorization)
-    r = db.query(models.User).filter(models.User.id == receiver_id).first()
-    s = db.query(models.User).filter(models.User.id == sender_id).first()
-    if not r or not s:
-        raise HTTPException(status_code=404, detail="User not found")
-    # upsert
-    exists = db.query(models.Subscription).filter(models.Subscription.receiver_id == r.id, models.Subscription.sender_id == s.id).first()
-    if not exists:
-        db.add(models.Subscription(receiver_id=r.id, sender_id=s.id))
-        db.flush()
-    return {"ok": True, "receiver_id": r.id, "sender_id": s.id}
+    try:
+        r = db.query(models.User).filter(models.User.id == receiver_id).first()
+        s = db.query(models.User).filter(models.User.id == sender_id).first()
+        if not r or not s:
+            raise HTTPException(status_code=404, detail="User not found")
+        # upsert
+        exists = db.query(models.Subscription).filter(
+            models.Subscription.receiver_id == r.id,
+            models.Subscription.sender_id == s.id
+        ).first()
+        if not exists:
+            db.add(models.Subscription(receiver_id=r.id, sender_id=s.id))
+            db.flush()
+
+        db.commit()
+        return {"ok": True, "receiver_id": r.id, "sender_id": s.id}
+    except:
+        db.rollback()
+        raise
 
 # ---------------- Activations list ----------------
 @app.get("/activations", response_model=ActivationsList)
 def activations(db: Session = Depends(get_db)):
     users = db.query(models.User).filter(models.User.is_active == True).all()
     return {"items": users}
-
-def notify_wordpress(user, token):
-    url = os.getenv("WP_CALLBACK_URL")
-    key = os.getenv("WP_CALLBACK_KEY")
-    if not url or not key:
-        return
-    try:
-        requests.post(
-            url,
-            json={"username": user.username, "email": user.email, "plan": token.plan, "api_key": token.token},
-            headers={"X-Callback-Key": key},
-            timeout=5,
-        )
-    except Exception as e:
-        logging.warning("WP callback failed: %s", e)
