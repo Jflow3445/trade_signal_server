@@ -2,8 +2,8 @@ import json
 import hmac
 import hashlib
 from datetime import datetime, timezone
-from typing import Optional
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, Query
+from typing import Optional, Dict, Any  # +Dict, Any
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, Query, Body 
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from database import SessionLocal, engine, Base
@@ -171,6 +171,85 @@ def verify_token(
         logging.exception("verify_token crashed")
         raise HTTPException(status_code=500, detail=f"verify_token crash: {e.__class__.__name__}: {e}")
 
+# ---------------- EA-friendly: validate (email + api_key) ----------------
+@app.post("/validate")
+async def validate_credentials(
+    body: Dict[str, Any] = Body(default={}),
+    db: Session = Depends(get_db),
+):
+    """
+    Credential check used by both EAs.
+    - Requires api_key
+    - If email provided, must match token owner's email (case-insensitive)
+    - Refuses expired/inactive tokens
+    - Returns quota & expiry info for client UX
+    NOTE: Returns 200 with {"ok": false, ...} on failures by default (non-breaking).
+          To return HTTP 401 instead, set env VALIDATE_STRICT_401=1.
+    """
+    # Best-effort purge (non-fatal)
+    try:
+        purged = crud.purge_expired_tokens(db)
+        if purged:
+            db.commit()
+    except Exception:
+        db.rollback()
+
+    email_in = (body or {}).get("email") or ""
+    api_key  = (body or {}).get("api_key") or ""
+
+    if not isinstance(email_in, str): email_in = ""
+    if not isinstance(api_key, str):  api_key  = ""
+    email_norm = email_in.strip().lower()
+    api_key    = api_key.strip()
+
+    # Require api_key
+    if not api_key:
+        if os.getenv("VALIDATE_STRICT_401"):
+            raise HTTPException(status_code=401, detail="api_key required")
+        return {"ok": False, "error": "api_key required"}
+
+    # Look up live token to enforce expiry and capture expiry time
+    now = crud.utc_now()
+    tok = db.query(models.APIToken).filter(
+        models.APIToken.token == api_key,
+        models.APIToken.is_active == True,
+        models.APIToken.expires_at > now
+    ).first()
+
+    if not tok or not tok.user or not tok.user.is_active:
+        if os.getenv("VALIDATE_STRICT_401"):
+            raise HTTPException(status_code=401, detail="invalid_or_expired_token")
+        return {"ok": False, "error": "invalid_or_expired_token"}
+
+    # If email supplied, bind token to that email
+    user_email_norm = (tok.user.email or "").strip().lower()
+    if email_norm and user_email_norm and email_norm != user_email_norm:
+        if os.getenv("VALIDATE_STRICT_401"):
+            raise HTTPException(status_code=401, detail="email_mismatch")
+        return {"ok": False, "error": "email_mismatch"}
+
+    limits = crud.plan_limits(tok.plan)
+    plan = tok.plan
+    daily_quota = limits.get("daily_quota")
+    unlimited   = bool(limits.get("unlimited"))
+
+    # Remaining today (computed, not consumed)
+    remaining_today = None
+    if not unlimited and daily_quota is not None:
+        token_hash = crud.hash_token_for_read(api_key)
+        used = crud.count_reads_today(db, tok.user, token_hash=token_hash)
+        remaining_today = max(0, int(daily_quota) - used)
+
+    return {
+        "ok": True,
+        "username": tok.user.username,
+        "plan": plan,
+        "daily_quota": daily_quota,
+        "unlimited": unlimited,
+        "remaining_today": remaining_today,
+        "expires_at": tok.expires_at.isoformat() if tok.expires_at else None,
+        "server_time": datetime.now(timezone.utc).isoformat(),
+    }
 
 # ---------------- Webhook: plan change from WP ----------------
 @app.post("/webhook/payment-approved")
@@ -353,6 +432,14 @@ def publish_signal(
     db.commit()  # ensure signal is persisted
     return sig
 
+# Back-compat for sender EA posting to /signals (instead of /signals/publish)
+@app.post("/signals")
+def publish_signal_compat(
+    payload: TradeSignalCreate,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    return publish_signal(payload, authorization, db)
 
 # ---------------- Signals: fetch latest for receiver (quota enforced) ----------------
 @app.get("/signals/latest", response_model=LatestSignalOut)
@@ -396,6 +483,45 @@ def latest_signals(
     db.commit()  # persist read counters
     return {"items": signals}
 
+# Back-compat for receiver EA that expects a top-level array instead of {"items":[...]}
+@app.get("/signals")
+def latest_signals_array(
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db),
+):
+    # purge
+    try:
+        purged = crud.purge_expired_tokens(db)
+        if purged:
+            db.commit()
+    except Exception:
+        db.rollback()
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization")
+    token = authorization.split(" ", 1)[1].strip()
+    ok, receiver, meta = crud.verify_token(db, token)
+    if not ok or not receiver:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    unlimited = bool(meta.get("unlimited"))
+    daily_quota = meta.get("daily_quota")
+    token_hash = crud.hash_token_for_read(token)
+
+    if not unlimited:
+        used = crud.count_reads_today(db, receiver, token_hash=token_hash)
+        remaining = max(0, int(daily_quota) - used) if daily_quota is not None else 0
+        if remaining <= 0:
+            return []  # IMPORTANT: plain array
+        limit = min(limit, remaining)
+
+    signals = crud.get_latest_signals_for_receiver(db, receiver, limit=limit)
+    for s in signals:
+        crud.record_signal_read(db, s.id, receiver, token_hash)
+
+    db.commit()
+    return signals
 
 # ---------------- Trades: record (optional) ----------------
 @app.post("/trades/record", response_model=TradeRecordOut)
@@ -422,6 +548,47 @@ def record_trade(
     db.commit()
     return tr
 
+# Back-compat for sender EA: accepts rich trade record payload
+@app.post("/trades")
+async def record_trade_compat(
+    request: Request,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    # Purge (non-fatal)
+    try:
+        purged = crud.purge_expired_tokens(db)
+        if purged:
+            db.commit()
+    except Exception:
+        db.rollback()
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization")
+
+    token = authorization.split(" ", 1)[1].strip()
+    ok, user, _ = crud.verify_token(db, token)
+    if not ok or not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+
+    symbol = (data.get("symbol") or "").strip()
+    if not symbol:
+        # keep non-breaking response
+        return {"ok": False, "error": "symbol required"}
+
+    action = (data.get("side") or data.get("action") or "record").strip().lower()
+    details = data  # store full payload for auditing
+
+    tr = crud.record_trade(db, user, symbol, action, details)
+    db.commit()
+    return {"ok": True, "id": tr.id}
 
 # ---------------- Subscriptions (admin helper) ----------------
 @app.post("/admin/subscribe")
