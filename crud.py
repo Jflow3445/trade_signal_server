@@ -199,7 +199,7 @@ def create_signal(
     sig = TradeSignal(
         user_id=sender.id, symbol=symbol, action=action,
         sl_pips=sl_pips, tp_pips=tp_pips,
-        lot_size=str(lot_size) if lot_size is not None else None,
+        lot_size=(float(lot_size) if lot_size is not None else None),
         details=details or {}, created_at=utc_now()
     )
     db.add(sig)

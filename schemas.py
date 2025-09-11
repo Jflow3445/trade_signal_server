@@ -19,7 +19,7 @@ class TradeSignalOut(BaseModel):
     action: str
     sl_pips: Optional[int] = None
     tp_pips: Optional[int] = None
-    lot_size: Optional[str] = None
+    lot_size: Optional[float | str] = None
     # Be tolerant to legacy rows (list/str/None) to avoid 500s
     details: Optional[Any] = None
     created_at: datetime

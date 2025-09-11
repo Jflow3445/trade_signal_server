@@ -1,7 +1,8 @@
 from datetime import datetime
 from sqlalchemy import (
-    Column, Integer, String, Boolean, DateTime, ForeignKey, JSON, UniqueConstraint, Index
+    Column, Integer, String, Boolean, DateTime, ForeignKey, JSON, UniqueConstraint, Index, Float
 )
+
 from sqlalchemy.orm import relationship
 from database import Base
 
@@ -54,7 +55,7 @@ class TradeSignal(Base):
     action = Column(String(20), nullable=False)  # buy/sell/adjust_sl/adjust_tp/close/hold
     sl_pips = Column(Integer, nullable=True)
     tp_pips = Column(Integer, nullable=True)
-    lot_size = Column(String(32), nullable=True)
+    lot_size = Column(Float, nullable=True)
     details = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
