@@ -2,7 +2,7 @@ import json
 import hmac
 import hashlib
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any  # +Dict, Any
+from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, Query, Body 
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -512,7 +512,7 @@ def latest_signals(
         logging.exception("record_signal_read failed; returning signals anyway")
     return {"items": signals}
 # Back-compat for receiver EA that expects a top-level array instead of {"items":[...]}
-@app.get("/signals")
+@app.get("/signals", response_model=List[TradeSignalOut])
 def latest_signals_array(
     authorization: Optional[str] = Header(None, alias="Authorization"),
     limit: int = Query(10, ge=1, le=50),

@@ -18,7 +18,8 @@ class TradeSignalOut(BaseModel):
     sl_pips: Optional[int] = None
     tp_pips: Optional[int] = None
     lot_size: Optional[str] = None
-    details: Optional[Dict[str, Any]] = None
+    # Be tolerant to legacy rows (list/str/None) to avoid 500s
+    details: Optional[Any] = None
     created_at: datetime
     class Config:
         from_attributes = True
