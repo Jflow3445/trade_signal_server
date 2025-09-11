@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from database import SessionLocal, engine, Base
 import models
 import crud
+from datetime import timedelta  
 import os, logging, requests
 
 from schemas import (
@@ -97,12 +98,6 @@ def _verify_webhook(header_sig: Optional[str], payload: bytes) -> None:
 
 
 def notify_wordpress(user, token):
-    """
-    Optional server -> WP callback.
-    Env needed on this server:
-      WP_CALLBACK_URL=https://nister.org/wp-json/nister/v1/trade-callback
-      WP_CALLBACK_KEY=<same hex set as NISTER_TRADE_CALLBACK_KEY in wp-config.php>
-    """
     url = os.getenv("WP_CALLBACK_URL")
     key = os.getenv("WP_CALLBACK_KEY")
     if not url or not key:
@@ -455,8 +450,11 @@ def publish_signal_compat(
 def latest_signals(
     authorization: Optional[str] = Header(None, alias="Authorization"),
     limit: int = Query(10, ge=1, le=50),
+    since_id: Optional[int] = Query(None, ge=0),
+    max_age_sec: Optional[int] = Query(None, ge=1, le=86400),
     db: Session = Depends(get_db),
 ):
+
     # purge
     try:
         purged = crud.purge_expired_tokens(db)
@@ -484,11 +482,24 @@ def latest_signals(
             return {"items": []}
         limit = min(limit, remaining)
 
-    signals = crud.get_latest_signals_for_receiver(db, receiver, limit=limit)
-    # Record reads
-    for s in signals:
-        crud.record_signal_read(db, s.id, receiver, token_hash)
+    min_created_at = None
+    if max_age_sec is not None:
+        min_created_at = crud.utc_now() - timedelta(seconds=int(max_age_sec))
 
+    signals = crud.get_signals_for_receiver_since(
+        db, receiver,
+        limit=limit,
+        since_id=since_id,
+        min_created_at=min_created_at,
+    )
+
+    # Only BUY/SELL consume quota; CLOSE/ADJUST/HOLD do not.
+    # Also guard with freshness (default 120s if client didn't send max_age_sec).
+    age_cutoff = crud.utc_now() - timedelta(seconds=int(max_age_sec or 120))
+    for s in signals:
+        act = (s.action or "").strip().lower()
+        if act in ("buy", "sell") and s.created_at and s.created_at >= age_cutoff:
+            crud.record_signal_read(db, s.id, receiver, token_hash)
     db.commit()  # persist read counters
     return {"items": signals}
 
@@ -497,6 +508,8 @@ def latest_signals(
 def latest_signals_array(
     authorization: Optional[str] = Header(None, alias="Authorization"),
     limit: int = Query(10, ge=1, le=50),
+    since_id: Optional[int] = Query(None, ge=0),
+    max_age_sec: Optional[int] = Query(None, ge=1, le=86400),
     db: Session = Depends(get_db),
 ):
     # purge
@@ -525,10 +538,22 @@ def latest_signals_array(
             return []  # IMPORTANT: plain array
         limit = min(limit, remaining)
 
-    signals = crud.get_latest_signals_for_receiver(db, receiver, limit=limit)
-    for s in signals:
-        crud.record_signal_read(db, s.id, receiver, token_hash)
+    min_created_at = None
+    if max_age_sec is not None:
+        min_created_at = crud.utc_now() - timedelta(seconds=int(max_age_sec))
 
+    signals = crud.get_signals_for_receiver_since(
+        db, receiver,
+        limit=limit,
+        since_id=since_id,
+        min_created_at=min_created_at,
+    )
+
+    age_cutoff = crud.utc_now() - timedelta(seconds=int(max_age_sec or 120))
+    for s in signals:
+        act = (s.action or "").strip().lower()
+        if act in ("buy", "sell") and s.created_at and s.created_at >= age_cutoff:
+            crud.record_signal_read(db, s.id, receiver, token_hash)
     db.commit()
     return signals
 

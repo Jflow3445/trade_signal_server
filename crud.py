@@ -217,6 +217,28 @@ def get_latest_signals_for_receiver(db: Session, receiver: User, limit: int = 20
     ).order_by(TradeSignal.id.desc()).limit(limit)
     return list(reversed(q.all()))  # ascending delivery
 
+def get_signals_for_receiver_since(
+    db: Session,
+    receiver: User,
+    limit: int = 20,
+    since_id: Optional[int] = None,
+    min_created_at: Optional[datetime] = None,
+) -> List[TradeSignal]:
+    subs = db.query(Subscription).filter(Subscription.receiver_id == receiver.id).all()
+    if not subs:
+        return []
+    sender_ids = [s.sender_id for s in subs]
+
+    q = db.query(TradeSignal).filter(TradeSignal.user_id.in_(sender_ids))
+    if since_id is not None and since_id > 0:
+        q = q.filter(TradeSignal.id > since_id)
+    if min_created_at is not None:
+        q = q.filter(TradeSignal.created_at >= min_created_at)
+
+    # Ascending so clients can process in order
+    q = q.order_by(TradeSignal.id.asc()).limit(limit)
+    return q.all()
+
 def count_reads_today(db: Session, receiver: User, token_hash: Optional[str] = None) -> int:
     sod = start_of_utc_day()
     q = db.query(SignalRead).filter(
