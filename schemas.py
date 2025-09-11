@@ -1,5 +1,4 @@
 from typing import Optional, Dict, Any, List
-from pydantic import BaseModel, Field
 from datetime import datetime
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -11,7 +10,8 @@ class TradeSignalCreate(BaseModel):
     sl_pips: Optional[int] = None
     tp_pips: Optional[int] = None
     lot_size: Optional[float] = None
-    details: Optional[Dict[str, Any]] = None
+    details: Optional[Any] = None
+
 
 class TradeSignalOut(BaseModel):
     id: int
@@ -32,13 +32,14 @@ class LatestSignalOut(BaseModel):
 class TradeRecordCreate(BaseModel):
     symbol: str
     action: str
-    details: Optional[Dict[str, Any]] = None
+    details: Optional[Any] = None
+
 
 class TradeRecordOut(BaseModel):
     id: int
     symbol: str
     action: str
-    details: Optional[Dict[str, Any]] = None
+    details: Optional[Any] = None
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 

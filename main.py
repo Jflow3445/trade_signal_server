@@ -11,6 +11,7 @@ import models
 import crud
 from datetime import timedelta  
 import os, logging, requests
+from pydantic import BaseModel, Field, ConfigDict
 
 from schemas import (
     TradeSignalCreate, TradeSignalOut, LatestSignalOut,
@@ -511,7 +512,7 @@ def latest_signals(
         db.rollback()
         logging.exception("record_signal_read failed; returning signals anyway")
     return {"items": signals}
-# Back-compat for receiver EA that expects a top-level array instead of {"items":[...]}
+
 @app.get("/signals", response_model=List[TradeSignalOut])
 def latest_signals_array(
     authorization: Optional[str] = Header(None, alias="Authorization"),
@@ -520,7 +521,7 @@ def latest_signals_array(
     max_age_sec: Optional[int] = Query(None, ge=1, le=86400),
     db: Session = Depends(get_db),
 ):
-    # purge
+    # purge (non-fatal)
     try:
         purged = crud.purge_expired_tokens(db)
         if purged:
@@ -531,6 +532,7 @@ def latest_signals_array(
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization")
     token = authorization.split(" ", 1)[1].strip()
+
     ok, receiver, meta = crud.verify_token(db, token)
     if not ok or not receiver:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -539,8 +541,8 @@ def latest_signals_array(
     daily_quota = meta.get("daily_quota")
     token_hash = crud.hash_token_for_read(token)
 
+    # Quota check
     if not unlimited:
-        token_hash = crud.hash_token_for_read(token)
         try:
             used = crud.count_reads_today(db, receiver, token_hash=token_hash)
         except Exception:
@@ -548,8 +550,9 @@ def latest_signals_array(
             used = 0
         remaining = max(0, int(daily_quota) - used) if daily_quota is not None else 0
         if remaining <= 0:
-            return []
+            return []  # array route returns a plain list when exhausted
         limit = min(limit, remaining)
+
     min_created_at = None
     if max_age_sec is not None:
         min_created_at = crud.utc_now() - timedelta(seconds=int(max_age_sec))
@@ -560,7 +563,8 @@ def latest_signals_array(
         since_id=since_id,
         min_created_at=min_created_at,
     )
-    age_cutoff = crud.utc_now() - timedelta(seconds=int(max_age_sec or 120))
+
+    # Consume quota only for fresh BUY/SELL (≤120s by default)
     now = crud.utc_now()
     try:
         for s in signals:
@@ -570,7 +574,9 @@ def latest_signals_array(
     except Exception:
         db.rollback()
         logging.exception("record_signal_read failed; returning signals anyway")
-    return signals
+
+    return signals  # array route returns a top-level list
+
 
 # ---------------- Trades: record (optional) ----------------
 @app.post("/trades/record", response_model=TradeRecordOut)
