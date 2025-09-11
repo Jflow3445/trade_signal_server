@@ -95,21 +95,24 @@ def upsert_active_token(db: Session, user: User, plan: Optional[str] = None, rot
             # keep existing token, just sync plan if drifted
             if active.plan != plan_norm:
                 active.plan = plan_norm
+            # Ensure farm_robot never expires (even if an older row had an expiry)
+            if (user.username or "").strip().lower() == "farm_robot" and active.expires_at is not None:
+                active.expires_at = None
             user.api_key = active.token
             user.plan = plan_norm
             user.updated_at = utc_now()
             db.flush()
             return active, False
-
     if not active:
         now = utc_now()
+        nonexpiring = (user.username or "").strip().lower() == "farm_robot"
         new_tok = APIToken(
             user_id=user.id,
             token=generate_token(),
             plan=plan_norm,
             is_active=True,
             created_at=now,
-            expires_at=now + MONTH,
+            expires_at=(None if nonexpiring else now + MONTH),
         )
         db.add(new_tok)
         user.api_key = new_tok.token
@@ -123,9 +126,8 @@ def verify_token(db: Session, api_key: str) -> Tuple[bool, Optional[User], Dict[
     tok = db.query(APIToken).filter(
         APIToken.token == api_key,
         APIToken.is_active == True,
-        APIToken.expires_at > now
+        (APIToken.expires_at == None) | (APIToken.expires_at > now)
     ).first()
-
     if tok and tok.user and tok.user.is_active:
         limits = plan_limits(tok.plan)
         expires_iso = (
@@ -167,6 +169,23 @@ def purge_expired_tokens(db: Session) -> int:
                 u.updated_at = now
     return len(expired)
 
+def ensure_subscription_to_sender(db: Session, receiver: User, sender_username: str = None) -> None:
+    """
+    Make sure `receiver` is subscribed to `sender_username` (default from env or 'farm_robot').
+    No-op if sender missing or already subscribed or same user.
+    """
+    sender_username = sender_username or os.getenv("DEFAULT_SIGNAL_SENDER", "farm_robot")
+    sender = db.query(User).filter(func.lower(User.username) == func.lower(sender_username)).first()
+    if not sender or sender.id == receiver.id:
+        return
+    exists = db.query(Subscription).filter(
+        Subscription.receiver_id == receiver.id,
+        Subscription.sender_id == sender.id
+    ).first()
+    if not exists:
+        db.add(Subscription(receiver_id=receiver.id, sender_id=sender.id))
+        db.flush()
+
 # ---------- Signals ----------
 def create_signal(
     db: Session, sender: User, symbol: str, action: str,
@@ -186,8 +205,13 @@ def get_latest_signals_for_receiver(db: Session, receiver: User, limit: int = 20
     # If subscriptions exist, only from those senders; else return empty
     subs = db.query(Subscription).filter(Subscription.receiver_id == receiver.id).all()
     if not subs:
-        return []
-    sender_ids = [s.sender_id for s in subs]
+        default_sender_name = os.getenv("DEFAULT_SIGNAL_SENDER", "farm_robot")
+        default_sender = db.query(User).filter(func.lower(User.username) == func.lower(default_sender_name)).first()
+        if not default_sender:
+            return []
+        sender_ids = [default_sender.id]
+    else:
+        sender_ids = [s.sender_id for s in subs]
     q = db.query(TradeSignal).filter(
         TradeSignal.user_id.in_(sender_ids)
     ).order_by(TradeSignal.id.desc()).limit(limit)

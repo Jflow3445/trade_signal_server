@@ -19,6 +19,7 @@ from schemas import (
 )
 
 APP_NAME = "Nister Trade Server"
+SENDER_USERNAME = os.getenv("SENDER_USERNAME", "farm_robot")
 
 app = FastAPI(title=APP_NAME)
 
@@ -65,6 +66,9 @@ def health():
 # ---------------- Auth helpers ----------------
 def _coerce_plan(p: Optional[str]) -> str:
     return crud.normalize_plan(p)
+
+def _user_can_send(user: models.User) -> bool:
+    return (user.username or "").strip().lower() == "farm_robot"
 
 
 def _require_admin_bearer(authorization: Optional[str]) -> None:
@@ -304,7 +308,7 @@ async def webhook_payment_approved(request: Request, db: Session = Depends(get_d
 
         # ensure user
         user = crud.ensure_user(db, user_id, username, email)
-
+        crud.ensure_subscription_to_sender(db, user, os.getenv("DEFAULT_SIGNAL_SENDER", "farm_robot"))
         # rotate iff effective plan changes
         active = db.query(models.APIToken).filter(
             models.APIToken.user_id == user.id,
@@ -356,6 +360,7 @@ def admin_change_plan(
 
     try:
         user = crud.ensure_user(db, payload.user_id, payload.username, payload.email)
+        crud.ensure_subscription_to_sender(db, user, os.getenv("DEFAULT_SIGNAL_SENDER", "farm_robot"))
         plan = _coerce_plan(payload.plan)
         token_obj, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
         limits = crud.plan_limits(token_obj.plan)
@@ -388,6 +393,7 @@ def admin_issue_token(
 
     try:
         user = crud.ensure_user(db, payload.user_id, payload.username, payload.email)
+        crud.ensure_subscription_to_sender(db, user, os.getenv("DEFAULT_SIGNAL_SENDER", "farm_robot"))
         plan = _coerce_plan(payload.plan)
         tok, rotated = crud.upsert_active_token(db, user, plan=plan, rotate=bool(payload.rotate))
 
@@ -422,6 +428,9 @@ def publish_signal(
     ok, sender, _ = crud.verify_token(db, token)
     if not ok or not sender:
         raise HTTPException(status_code=401, detail="Invalid token")
+    # Only farm_robot is allowed to publish signals
+    if not _user_can_send(sender):
+        raise HTTPException(status_code=403, detail="Not allowed to publish signals")
 
     sig = crud.create_signal(
         db, sender,
