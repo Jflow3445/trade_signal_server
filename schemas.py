@@ -1,6 +1,8 @@
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from datetime import datetime
+from pydantic import BaseModel, Field, ConfigDict
+
 
 # ---- Signals ----
 class TradeSignalCreate(BaseModel):
@@ -21,8 +23,7 @@ class TradeSignalOut(BaseModel):
     # Be tolerant to legacy rows (list/str/None) to avoid 500s
     details: Optional[Any] = None
     created_at: datetime
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class LatestSignalOut(BaseModel):
     items: List[TradeSignalOut] = Field(default_factory=list)
@@ -39,8 +40,7 @@ class TradeRecordOut(BaseModel):
     action: str
     details: Optional[Dict[str, Any]] = None
     created_at: datetime
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 # ---- Admin/user ----
 class UserOut(BaseModel):
@@ -50,8 +50,7 @@ class UserOut(BaseModel):
     plan: str
     api_key: Optional[str] = None
     is_active: bool
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class PlanChangeIn(BaseModel):
     user_id: Optional[int] = None
