@@ -477,12 +477,16 @@ def latest_signals(
     token_hash = crud.hash_token_for_read(token)
 
     if not unlimited:
-        used = crud.count_reads_today(db, receiver, token_hash=token_hash)
+        token_hash = crud.hash_token_for_read(token)
+        try:
+            used = crud.count_reads_today(db, receiver, token_hash=token_hash)
+        except Exception:
+            logging.exception("count_reads_today failed; assuming used=0")
+            used = 0
         remaining = max(0, int(daily_quota) - used) if daily_quota is not None else 0
         if remaining <= 0:
             return {"items": []}
         limit = min(limit, remaining)
-
     min_created_at = None
     if max_age_sec is not None:
         min_created_at = crud.utc_now() - timedelta(seconds=int(max_age_sec))
@@ -498,12 +502,15 @@ def latest_signals(
     # Also guard with freshness (default 120s if client didn't send max_age_sec).
     age_cutoff = crud.utc_now() - timedelta(seconds=int(max_age_sec or 120))
     now = crud.utc_now()
-    for s in signals:
-        if s.action in ("buy","sell") and (s.created_at is None or (now - s.created_at).total_seconds() <= 120):
-            crud.record_signal_read(db, s.id, receiver, token_hash)
-    db.commit()
+    try:
+        for s in signals:
+            if s.action in ("buy", "sell") and (s.created_at is None or (now - s.created_at).total_seconds() <= 120):
+                crud.record_signal_read(db, s.id, receiver, token_hash)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logging.exception("record_signal_read failed; returning signals anyway")
     return {"items": signals}
-
 # Back-compat for receiver EA that expects a top-level array instead of {"items":[...]}
 @app.get("/signals")
 def latest_signals_array(
@@ -533,12 +540,16 @@ def latest_signals_array(
     token_hash = crud.hash_token_for_read(token)
 
     if not unlimited:
-        used = crud.count_reads_today(db, receiver, token_hash=token_hash)
+        token_hash = crud.hash_token_for_read(token)
+        try:
+            used = crud.count_reads_today(db, receiver, token_hash=token_hash)
+        except Exception:
+            logging.exception("count_reads_today failed; assuming used=0")
+            used = 0
         remaining = max(0, int(daily_quota) - used) if daily_quota is not None else 0
         if remaining <= 0:
-            return []  # IMPORTANT: plain array
+            return []
         limit = min(limit, remaining)
-
     min_created_at = None
     if max_age_sec is not None:
         min_created_at = crud.utc_now() - timedelta(seconds=int(max_age_sec))
@@ -550,11 +561,15 @@ def latest_signals_array(
         min_created_at=min_created_at,
     )
     age_cutoff = crud.utc_now() - timedelta(seconds=int(max_age_sec or 120))
-    for s in signals:
-        act = (s.action or "").strip().lower()
-        if act in ("buy", "sell") and s.created_at and s.created_at >= age_cutoff:
-            crud.record_signal_read(db, s.id, receiver, token_hash)
-    db.commit()
+    now = crud.utc_now()
+    try:
+        for s in signals:
+            if s.action in ("buy", "sell") and (s.created_at is None or (now - s.created_at).total_seconds() <= 120):
+                crud.record_signal_read(db, s.id, receiver, token_hash)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logging.exception("record_signal_read failed; returning signals anyway")
     return signals
 
 # ---------------- Trades: record (optional) ----------------

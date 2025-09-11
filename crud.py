@@ -6,6 +6,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from models import User, APIToken, TradeSignal, Subscription, SignalRead, TradeRecord
 from sqlalchemy import text
+import os
+import logging
+from sqlalchemy import insert
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 # ---------- Plans & quotas ----------
 PLAN_DEFAULTS = {
     "free":   {"daily_quota": 1, "unlimited": False},
@@ -253,15 +258,37 @@ def count_reads_today(db: Session, receiver: User, token_hash: Optional[str] = N
     return q.count()
 
 def record_signal_read(db: Session, signal_id: int, receiver: User, token_hash: str) -> None:
-    # Idempotent insert; duplicate “reads” are ignored by the unique key
-    db.execute(
-        text("""
-        INSERT INTO signal_reads (signal_id, receiver_id, token_hash, read_at)
-        VALUES (:sid, :rid, :th, (NOW() AT TIME ZONE 'UTC'))
-        ON CONFLICT (signal_id, receiver_id, token_hash) DO NOTHING
-        """),
-        {"sid": signal_id, "rid": receiver.id, "th": token_hash},
-    )
+    """
+    Idempotent 'read' accounting for quota. Never raises on duplicate.
+    Works across Postgres/MySQL/SQLite (uses ON CONFLICT only when available).
+    """
+    values = {
+        "signal_id": signal_id,
+        "receiver_id": receiver.id,
+        "token_hash": token_hash,
+        "read_at": utc_now(),  # Python UTC timestamp (DB-agnostic)
+    }
+    tbl = SignalRead.__table__
+
+    # Prefer native Postgres ON CONFLICT when available
+    try:
+        if db.bind.dialect.name == "postgresql":
+            stmt = pg_insert(tbl).values(**values).on_conflict_do_nothing(
+                index_elements=["signal_id", "receiver_id", "token_hash"]
+            )
+            db.execute(stmt)
+            return
+
+        # Generic path: try once, ignore duplicate via IntegrityError
+        stmt = insert(tbl).values(**values)
+        try:
+            db.execute(stmt)
+        except IntegrityError:
+            db.rollback()  # duplicate; ignore
+    except Exception:
+        logging.exception("record_signal_read failed")
+        # Let caller decide to rollback/continue
+
 # ---------- Trades ----------
 def record_trade(db: Session, receiver: User, symbol: str, action: str, details=None) -> TradeRecord:
     tr = TradeRecord(user_id=receiver.id, action=action, symbol=symbol, details=details or {}, created_at=utc_now())
