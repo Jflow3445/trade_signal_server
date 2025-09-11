@@ -5,7 +5,7 @@ from typing import Optional, Tuple, List, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from models import User, APIToken, TradeSignal, Subscription, SignalRead, TradeRecord
-
+from sqlalchemy import text
 # ---------- Plans & quotas ----------
 PLAN_DEFAULTS = {
     "free":   {"daily_quota": 1, "unlimited": False},
@@ -241,23 +241,27 @@ def get_signals_for_receiver_since(
 
 def count_reads_today(db: Session, receiver: User, token_hash: Optional[str] = None) -> int:
     sod = start_of_utc_day()
-    q = db.query(SignalRead).filter(
-        SignalRead.receiver_id == receiver.id,
-        SignalRead.read_at >= sod
-    )
+    q = (db.query(SignalRead)
+           .join(TradeSignal, TradeSignal.id == SignalRead.signal_id)
+           .filter(
+                SignalRead.receiver_id == receiver.id,
+                SignalRead.read_at >= sod,
+                TradeSignal.action.in_(("buy", "sell"))
+           ))
     if token_hash:
         q = q.filter(SignalRead.token_hash == token_hash)
     return q.count()
 
-def record_signal_read(db: Session, signal_id: int, receiver: User, token_hash: str):
-    # Insert best-effort; unique constraint prevents double-count inflations
-    sr = SignalRead(signal_id=signal_id, receiver_id=receiver.id, token_hash=token_hash, read_at=utc_now())
-    db.add(sr)
-    try:
-        db.flush()
-    except Exception:
-        db.rollback()
-
+def record_signal_read(db: Session, signal_id: int, receiver: User, token_hash: str) -> None:
+    # Idempotent insert; duplicate “reads” are ignored by the unique key
+    db.execute(
+        text("""
+        INSERT INTO signal_reads (signal_id, receiver_id, token_hash, read_at)
+        VALUES (:sid, :rid, :th, (NOW() AT TIME ZONE 'UTC'))
+        ON CONFLICT (signal_id, receiver_id, token_hash) DO NOTHING
+        """),
+        {"sid": signal_id, "rid": receiver.id, "th": token_hash},
+    )
 # ---------- Trades ----------
 def record_trade(db: Session, receiver: User, symbol: str, action: str, details=None) -> TradeRecord:
     tr = TradeRecord(user_id=receiver.id, action=action, symbol=symbol, details=details or {}, created_at=utc_now())

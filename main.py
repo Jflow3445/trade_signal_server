@@ -454,6 +454,7 @@ def latest_signals(
     max_age_sec: Optional[int] = Query(None, ge=1, le=86400),
     db: Session = Depends(get_db),
 ):
+    
 
     # purge
     try:
@@ -496,11 +497,11 @@ def latest_signals(
     # Only BUY/SELL consume quota; CLOSE/ADJUST/HOLD do not.
     # Also guard with freshness (default 120s if client didn't send max_age_sec).
     age_cutoff = crud.utc_now() - timedelta(seconds=int(max_age_sec or 120))
+    now = crud.utc_now()
     for s in signals:
-        act = (s.action or "").strip().lower()
-        if act in ("buy", "sell") and s.created_at and s.created_at >= age_cutoff:
+        if s.action in ("buy","sell") and (s.created_at is None or (now - s.created_at).total_seconds() <= 120):
             crud.record_signal_read(db, s.id, receiver, token_hash)
-    db.commit()  # persist read counters
+    db.commit()
     return {"items": signals}
 
 # Back-compat for receiver EA that expects a top-level array instead of {"items":[...]}
@@ -548,7 +549,6 @@ def latest_signals_array(
         since_id=since_id,
         min_created_at=min_created_at,
     )
-
     age_cutoff = crud.utc_now() - timedelta(seconds=int(max_age_sec or 120))
     for s in signals:
         act = (s.action or "").strip().lower()
